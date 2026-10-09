@@ -36,6 +36,56 @@ go run ./cmd/lb
 
 The backend targets and the load balancer listen address are currently defined in code: `http://localhost:9001`, `http://localhost:9002`, `http://localhost:9003`, and `:8080`, respectively.
 
+## Configuration
+
+The load balancer reads configuration at startup from three layers, in precedence order:
+
+1. built-in defaults
+2. environment variables
+3. command-line flags
+
+The effective values are logged at startup and any invalid configuration exits with a non-zero status before the HTTP server begins accepting traffic.
+
+### Supported settings
+
+| Setting | Env var | Flag | Default | Purpose |
+| --- | --- | --- | --- | --- |
+| Listen address | `LB_LISTEN_ADDR` | `-listen` | `:8080` | Address the HTTP server binds to |
+| Backends | `LB_BACKENDS` | `-backends` | `http://localhost:9001,http://localhost:9002,http://localhost:9003` | Comma-separated backend URLs |
+| Health interval | `LB_HEALTH_INTERVAL` | `-health-interval` | `5s` | How often the pool probes backends |
+| Health timeout | `LB_HEALTH_TIMEOUT` | `-health-timeout` | `2s` | Timeout for health-check HTTP requests |
+| Dial timeout | `LB_DIAL_TIMEOUT` | `-dial-timeout` | `3s` | Timeout for backend connection attempts |
+| Response timeout | `LB_RESPONSE_TIMEOUT` | `-response-timeout` | `10s` | Response-header timeout for proxied requests |
+| Read-header timeout | `LB_READ_HEADER_TIMEOUT` | `-read-header-timeout` | `5s` | Server read-header timeout |
+| Read timeout | `LB_READ_TIMEOUT` | `-read-timeout` | `15s` | Server read timeout |
+| Write timeout | `LB_WRITE_TIMEOUT` | `-write-timeout` | `30s` | Server write timeout |
+| Idle timeout | `LB_IDLE_TIMEOUT` | `-idle-timeout` | `60s` | Idle keepalive timeout |
+| Shutdown timeout | `LB_SHUTDOWN_TIMEOUT` | `-shutdown-timeout` | `15s` | Graceful shutdown deadline |
+
+The project includes a tracked template at [`.env.example`](./.env.example) with the default values and a matching `.env` that is ignored by Git.
+
+### Examples
+
+```sh
+LB_LISTEN_ADDR=:9090 go run ./cmd/lb
+go run ./cmd/lb -listen :9191 -backends http://localhost:9001,http://localhost:9002
+LB_BACKENDS=http://localhost:9001,http://localhost:9002 go run ./cmd/lb -health-timeout 1s
+```
+
+`LB_BACKENDS` accepts a comma-separated list and ignores empty entries, so values like `http://localhost:9001, ,http://localhost:9002` still work.
+
+### Validation behavior
+
+The configuration layer validates the final values before startup:
+
+- at least one backend URL is required
+- every backend must parse as a valid URL
+- duplicate backend URLs are rejected
+- the listen address must be valid for `net.Listen`
+- durations must parse cleanly and be positive when required
+
+Use `go run ./cmd/lb -h` to print the built-in usage text and defaults.
+
 ## Try it
 
 Send repeated requests through the load balancer:
@@ -80,6 +130,10 @@ The tests in [`cmd/lb/main_test.go`](./cmd/lb/main_test.go) cover the following 
 - `TestConcurrentRequests`: verifies 100 concurrent requests all succeed when the pool has healthy backends available.
 
 The fake backends are `httptest` servers that expose a controllable health flag. Each backend can be flipped between healthy and unhealthy while the tests exercise the real load balancer logic without third-party libraries.
+
+### Test design notes
+
+Readiness checks use a TCP dial rather than an HTTP request because an HTTP probe would pass through the balancer and reach the blocking fake backend. Blocking backend handlers also watch the request context, so cancellation can unblock them; test cleanup closes the release channel before closing the `httptest.Server`, which may wait for active handlers. The in-flight shutdown test waits for the backend's arrival signal instead of sleeping, ensuring shutdown begins only after the proxied request is actually in progress.
 
 ## Concurrency and race detection
 

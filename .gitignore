@@ -1,4 +1,15 @@
+# compiled binaries (root only, so cmd/backend and cmd/lb are not ignored)
 /backend
 /lb
 *.exe
+
+# local config and secrets
+.env
+
+# editor and tool folders
 .vscode/
+/.agents/
+/.codex/
+
+# temporary output
+*.out

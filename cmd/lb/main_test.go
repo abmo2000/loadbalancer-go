@@ -73,19 +73,93 @@ func doRequest(t *testing.T, pool *Pool) *httptest.ResponseRecorder {
 	return rec
 }
 
-func waitForServerReady(t *testing.T, url string) {
+func waitForServerReady(t *testing.T, addr string) {
 	t.Helper()
-	client := &http.Client{Timeout: 100 * time.Millisecond}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(url)
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
-			_ = resp.Body.Close()
+			_ = conn.Close()
 			return
 		}
-		<-time.After(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("server at %s did not become ready", url)
+	t.Fatalf("server at %s did not become ready for TCP connections", addr)
+}
+
+type blockingTestBackend struct {
+	server      *httptest.Server
+	arrived     chan struct{}
+	release     chan struct{}
+	arrivalOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingTestBackend(t *testing.T, body string) *blockingTestBackend {
+	t.Helper()
+	backend := &blockingTestBackend{
+		arrived: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	backend.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backend.arrivalOnce.Do(func() { close(backend.arrived) })
+		select {
+		case <-backend.release:
+			_, _ = fmt.Fprint(w, body)
+		case <-r.Context().Done():
+		}
+	}))
+	// Cleanups run in reverse order: release blocked handlers before Server.Close waits on them.
+	t.Cleanup(backend.server.Close)
+	t.Cleanup(backend.Release)
+	return backend
+}
+
+func (backend *blockingTestBackend) Release() {
+	backend.releaseOnce.Do(func() { close(backend.release) })
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	select {
+	case <-signal:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitForResult[T any](t *testing.T, result <-chan T, description string, timeout time.Duration) T {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	select {
+	case value := <-result:
+		return value
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", description, ctx.Err())
+		var zero T
+		return zero
+	}
+}
+
+func waitForStoppedListener(t *testing.T, addr string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			t.Fatalf("listener at %s still accepts connections after shutdown: %v", addr, ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func TestRoundRobin(t *testing.T) {
@@ -288,21 +362,8 @@ func TestConcurrentRequests(t *testing.T) {
 }
 
 func TestGracefulShutdown_FinishesInFlightRequest(t *testing.T) {
-	// A request already in flight must finish cleanly even after the shutdown signal is received.
-	backendEntered := make(chan struct{})
-	releaseBackend := make(chan struct{})
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-backendEntered:
-		default:
-			close(backendEntered)
-		}
-		<-releaseBackend
-		_, _ = fmt.Fprint(w, "slow-response")
-	}))
-	defer backend.Close()
-
-	pool, err := NewPool([]string{backend.URL}, 200*time.Millisecond)
+	backend := newBlockingTestBackend(t, "done")
+	pool, err := NewPool([]string{backend.server.URL}, 200*time.Millisecond)
 	if err != nil {
 		t.Fatalf("NewPool returned error: %v", err)
 	}
@@ -310,64 +371,57 @@ func TestGracefulShutdown_FinishesInFlightRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen returned error: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	srv := &http.Server{Addr: listener.Addr().String(), Handler: pool.Handler()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serverErrCh := make(chan error, 1)
 	go func() {
-		serverErrCh <- runServerWithServeFunc(ctx, srv, time.Second, func() error { return srv.Serve(listener) })
+		serverErrCh <- runServerWithListener(ctx, srv, time.Second, listener)
 	}()
 
-	url := "http://" + listener.Addr().String()
-	waitForServerReady(t, url)
+	addr := listener.Addr().String()
+	url := "http://" + addr
+	waitForServerReady(t, addr)
 
-	requestDone := make(chan string, 1)
+	type response struct {
+		status int
+		body   string
+		err    error
+	}
+	requestDone := make(chan response, 1)
 	go func() {
 		resp, err := http.Get(url)
 		if err != nil {
-			requestDone <- ""
+			requestDone <- response{err: err}
 			return
 		}
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
-		requestDone <- string(body)
+		requestDone <- response{status: resp.StatusCode, body: string(body)}
 	}()
 
-	<-backendEntered
+	waitForSignal(t, backend.arrived, "the proxied request to arrive at the backend")
 	cancel()
-	close(releaseBackend)
-
-	select {
-	case got := <-requestDone:
-		if got != "slow-response" {
-			t.Fatalf("request body = %q; want slow-response", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("in-flight request did not complete before shutdown timeout")
+	waitForStoppedListener(t, addr)
+	backend.Release()
+	got := waitForResult(t, requestDone, "the in-flight request to finish", 5*time.Second)
+	if got.err != nil {
+		t.Fatalf("in-flight request failed: %v", got.err)
 	}
-	if err := <-serverErrCh; err != nil {
+	if got.status != http.StatusOK || got.body != "done" {
+		t.Fatalf("in-flight response = %d %q; want 200 %q", got.status, got.body, "done")
+	}
+	if err := waitForResult(t, serverErrCh, "runServer to return after graceful shutdown", 5*time.Second); err != nil {
 		t.Fatalf("runServer returned error during graceful shutdown: %v", err)
 	}
 }
 
 func TestGracefulShutdown_RejectsNewRequests(t *testing.T) {
 	// After shutdown begins, new requests must fail while the earlier request continues to completion.
-	backendEntered := make(chan struct{})
-	releaseBackend := make(chan struct{})
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-backendEntered:
-		default:
-			close(backendEntered)
-		}
-		<-releaseBackend
-		_, _ = fmt.Fprint(w, "slow-response")
-	}))
-	defer backend.Close()
-
-	pool, err := NewPool([]string{backend.URL}, 200*time.Millisecond)
+	backend := newBlockingTestBackend(t, "slow-response")
+	pool, err := NewPool([]string{backend.server.URL}, 200*time.Millisecond)
 	if err != nil {
 		t.Fatalf("NewPool returned error: %v", err)
 	}
@@ -375,18 +429,19 @@ func TestGracefulShutdown_RejectsNewRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen returned error: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	srv := &http.Server{Addr: listener.Addr().String(), Handler: pool.Handler()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serverErrCh := make(chan error, 1)
 	go func() {
-		serverErrCh <- runServerWithServeFunc(ctx, srv, time.Second, func() error { return srv.Serve(listener) })
+		serverErrCh <- runServerWithListener(ctx, srv, time.Second, listener)
 	}()
 
-	url := "http://" + listener.Addr().String()
-	waitForServerReady(t, url)
+	addr := listener.Addr().String()
+	url := "http://" + addr
+	waitForServerReady(t, addr)
 
 	requestDone := make(chan error, 1)
 	go func() {
@@ -400,38 +455,22 @@ func TestGracefulShutdown_RejectsNewRequests(t *testing.T) {
 		requestDone <- nil
 	}()
 
-	<-backendEntered
+	waitForSignal(t, backend.arrived, "the proxied request to arrive at the backend")
 	cancel()
-	close(releaseBackend)
-	if err := <-requestDone; err != nil {
+	waitForStoppedListener(t, addr)
+	backend.Release()
+	if err := waitForResult(t, requestDone, "the initial request to finish", 5*time.Second); err != nil {
 		t.Fatalf("initial request failed before shutdown completed: %v", err)
 	}
-
-	_, err = http.Get(url)
-	if err == nil {
-		t.Fatal("new request unexpectedly succeeded after shutdown started")
-	}
-	if err := <-serverErrCh; err != nil {
+	if err := waitForResult(t, serverErrCh, "runServer to return after graceful shutdown", 5*time.Second); err != nil {
 		t.Fatalf("runServer returned unexpected error: %v", err)
 	}
 }
 
 func TestGracefulShutdown_TimeoutForcesClose(t *testing.T) {
 	// A blocked backend must not keep the shutdown from returning after the timeout budget is exhausted.
-	backendEntered := make(chan struct{})
-	releaseBackend := make(chan struct{})
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-backendEntered:
-		default:
-			close(backendEntered)
-		}
-		<-releaseBackend
-		_, _ = fmt.Fprint(w, "slow-response")
-	}))
-	defer backend.Close()
-
-	pool, err := NewPool([]string{backend.URL}, 200*time.Millisecond)
+	backend := newBlockingTestBackend(t, "slow-response")
+	pool, err := NewPool([]string{backend.server.URL}, 200*time.Millisecond)
 	if err != nil {
 		t.Fatalf("NewPool returned error: %v", err)
 	}
@@ -439,18 +478,19 @@ func TestGracefulShutdown_TimeoutForcesClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen returned error: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	srv := &http.Server{Addr: listener.Addr().String(), Handler: pool.Handler()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serverErrCh := make(chan error, 1)
 	go func() {
-		serverErrCh <- runServerWithServeFunc(ctx, srv, 50*time.Millisecond, func() error { return srv.Serve(listener) })
+		serverErrCh <- runServerWithListener(ctx, srv, 50*time.Millisecond, listener)
 	}()
 
-	url := "http://" + listener.Addr().String()
-	waitForServerReady(t, url)
+	addr := listener.Addr().String()
+	url := "http://" + addr
+	waitForServerReady(t, addr)
 
 	requestDone := make(chan error, 1)
 	go func() {
@@ -464,18 +504,14 @@ func TestGracefulShutdown_TimeoutForcesClose(t *testing.T) {
 		requestDone <- nil
 	}()
 
-	<-backendEntered
+	waitForSignal(t, backend.arrived, "the proxied request to arrive at the backend")
 	cancel()
-	close(releaseBackend)
-	select {
-	case err := <-serverErrCh:
-		if err == nil {
-			t.Fatal("runServer returned nil after timeout; expected shutdown error")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("runServer did not return within the timeout window")
+	err = waitForResult(t, serverErrCh, "runServer to return after the shutdown timeout", 2*time.Second)
+	if err == nil {
+		t.Fatal("runServer returned nil after timeout; expected shutdown error")
 	}
-	if err := <-requestDone; err != nil && !strings.Contains(err.Error(), "EOF") {
+	backend.Release()
+	if err := waitForResult(t, requestDone, "the request to finish after forced shutdown", 5*time.Second); err != nil && !strings.Contains(err.Error(), "EOF") {
 		t.Fatalf("request ended with unexpected error: %v", err)
 	}
 }
@@ -506,22 +542,19 @@ func TestGracefulShutdown_NoRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen returned error: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	srv := &http.Server{Addr: listener.Addr().String(), Handler: http.NewServeMux()}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 	serverErrCh := make(chan error, 1)
 	go func() {
-		serverErrCh <- runServerWithServeFunc(ctx, srv, time.Second, func() error { return srv.Serve(listener) })
+		serverErrCh <- runServerWithListener(ctx, srv, time.Second, listener)
 	}()
-	select {
-	case err := <-serverErrCh:
-		if err != nil {
-			t.Fatalf("unexpected error on empty shutdown: %v", err)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("shutdown with no traffic did not return promptly")
+	waitForServerReady(t, listener.Addr().String())
+	cancel()
+	if err := waitForResult(t, serverErrCh, "idle server shutdown", 5*time.Second); err != nil {
+		t.Fatalf("unexpected error on empty shutdown: %v", err)
 	}
 }
 

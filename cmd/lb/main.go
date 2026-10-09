@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -24,11 +25,21 @@ type Backend struct {
 	alive bool
 }
 
-func NewBackend(u *url.URL, responseTimeout time.Duration) *Backend {
+func NewBackend(u *url.URL, args ...time.Duration) *Backend {
+	dialTimeout := 3 * time.Second
+	responseTimeout := 10 * time.Second
+	switch len(args) {
+	case 1:
+		responseTimeout = args[0]
+	case 2:
+		dialTimeout = args[0]
+		responseTimeout = args[1]
+	}
+
 	b := &Backend{URL: u, alive: true}
 	b.Proxy = httputil.NewSingleHostReverseProxy(u)
 	b.Proxy.Transport = &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
 		ResponseHeaderTimeout: responseTimeout,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   100,
@@ -57,18 +68,28 @@ func (b *Backend) IsAlive() bool {
 }
 
 type Pool struct {
-	backends []*Backend
-	counter  uint64
+	backends      []*Backend
+	counter       uint64
+	healthTimeout time.Duration
 }
 
-func NewPool(targets []string, responseTimeout time.Duration) (*Pool, error) {
-	pool := &Pool{}
+func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
+	dialTimeout := 3 * time.Second
+	responseTimeout := 10 * time.Second
+	switch len(args) {
+	case 1:
+		responseTimeout = args[0]
+	case 2:
+		dialTimeout = args[0]
+		responseTimeout = args[1]
+	}
+	pool := &Pool{healthTimeout: 2 * time.Second}
 	for _, target := range targets {
 		u, err := url.Parse(target)
 		if err != nil {
 			return nil, err
 		}
-		pool.backends = append(pool.backends, NewBackend(u, responseTimeout))
+		pool.backends = append(pool.backends, NewBackend(u, dialTimeout, responseTimeout))
 	}
 	return pool, nil
 }
@@ -89,7 +110,11 @@ func (p *Pool) Next() *Backend {
 }
 
 func (p *Pool) CheckOnce() {
-	client := http.Client{Timeout: 2 * time.Second}
+	timeout := p.healthTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	client := http.Client{Timeout: timeout}
 	for _, b := range p.backends {
 		resp, err := client.Get(b.URL.String())
 		alive := err == nil && resp.StatusCode < 500
@@ -171,37 +196,54 @@ func runServer(ctx context.Context, srv *http.Server, shutdownTimeout time.Durat
 	return runServerWithServeFunc(ctx, srv, shutdownTimeout, srv.ListenAndServe)
 }
 
+func runServerWithListener(ctx context.Context, srv *http.Server, shutdownTimeout time.Duration, listener net.Listener) error {
+	return runServerWithServeFunc(ctx, srv, shutdownTimeout, func() error {
+		return srv.Serve(listener)
+	})
+}
+
 func main() {
-	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "time allowed for graceful shutdown")
-	flag.Parse()
+	env := func(name string) string {
+		if value, ok := os.LookupEnv(name); ok {
+			return value
+		}
+		return missingEnvValue
+	}
+	cfg, err := LoadConfig(env, os.Args[1:])
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+	log.Println(cfg.String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	targets := []string{
-		"http://localhost:9001",
-		"http://localhost:9002",
-		"http://localhost:9003",
-	}
-
-	pool, err := NewPool(targets, 10*time.Second)
+	pool, err := NewPool(cfg.Backends, cfg.DialTimeout, cfg.ResponseTimeout)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	go pool.HealthCheckContext(ctx, 5*time.Second)
+	pool.healthTimeout = cfg.HealthTimeout
+	go pool.HealthCheckContext(ctx, cfg.HealthInterval)
 
 	srv := &http.Server{
-		Addr:              ":8080",
+		Addr:              cfg.ListenAddr,
 		Handler:           pool.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 
-	log.Println("load balancer listening on :8080")
-	if err := runServer(ctx, srv, *shutdownTimeout); err != nil {
+	log.Printf("load balancer listening on %s", cfg.ListenAddr)
+	if err := runServer(ctx, srv, cfg.ShutdownTimeout); err != nil {
 		log.Printf("server shutdown error: %v", err)
 		os.Exit(1)
 	}
