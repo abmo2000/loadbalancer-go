@@ -81,6 +81,26 @@ The tests in [`cmd/lb/main_test.go`](./cmd/lb/main_test.go) cover the following 
 
 The fake backends are `httptest` servers that expose a controllable health flag. Each backend can be flipped between healthy and unhealthy while the tests exercise the real load balancer logic without third-party libraries.
 
+## Concurrency and race detection
+
+The race detector is relevant here because the health check goroutine writes the backend `alive` flag while request goroutines read it, and the pool round-robin counter is shared across goroutines. The backend state is protected by a `sync.RWMutex`, while the counter uses `sync/atomic` to avoid lost updates during concurrent selection.
+
+Run the race checks with:
+
+```sh
+go test -race ./...
+go test -race -count=20 ./cmd/lb
+```
+
+The additional concurrency tests cover the following behaviors:
+
+- `TestRace_StateUpdatesDuringRequests`: verifies health checks, backend toggles, and request handling can run at the same time without races or invalid status codes.
+- `TestRace_SetAliveIsAlive`: verifies `SetAlive` and `IsAlive` stay safe under heavy concurrent access.
+- `TestNext_ConcurrentDistribution`: verifies the atomic counter in `Next()` distributes work evenly across three backends.
+- `TestNext_NeverReturnsDeadBackend`: verifies a backend marked dead is never selected again, even while other backends are toggled.
+
+The race detector only reports races that actually execute, so these tests deliberately create heavy concurrent load to exercise the critical paths.
+
 ## Refactor notes
 
 `main()` was split into `NewBackend`, `NewPool`, `CheckOnce`, and `Handler` so the load balancer could be constructed and exercised in tests without starting a network listener. This keeps the program behavior the same while making the logic testable as plain Go code. The proxying, health checks, failover behavior, and timeout handling were not changed.

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -265,5 +267,181 @@ func TestConcurrentRequests(t *testing.T) {
 	wg.Wait()
 	if got := failures.Load(); got != 0 {
 		t.Fatalf("%d concurrent requests failed; want 0", got)
+	}
+}
+
+func TestRace_StateUpdatesDuringRequests(t *testing.T) {
+	// Health checks, backend toggles, and request handling must coexist without races or invalid status codes.
+	b1 := newControllableBackend(t, "backend-1")
+	b2 := newControllableBackend(t, "backend-2")
+	b3 := newControllableBackend(t, "backend-3")
+	defer b1.Close()
+	defer b2.Close()
+	defer b3.Close()
+
+	pool := newPoolFromBackends(t, b1, b2, b3)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	var badStatus atomic.Int32
+	var wg sync.WaitGroup
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				rec := doRequest(t, pool)
+				if rec.Code != http.StatusOK && rec.Code != http.StatusBadGateway && rec.Code != http.StatusServiceUnavailable {
+					badStatus.Add(1)
+				}
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			pool.CheckOnce()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		healthy := true
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			b1.SetHealthy(healthy)
+			healthy = !healthy
+		}
+	}()
+
+	wg.Wait()
+	if got := badStatus.Load(); got != 0 {
+		t.Fatalf("saw %d unexpected status codes during concurrent state updates", got)
+	}
+}
+
+func TestRace_SetAliveIsAlive(t *testing.T) {
+	// SetAlive and IsAlive must be safe when called concurrently from many goroutines.
+	u, err := url.Parse("http://example.com")
+	if err != nil {
+		t.Fatalf("parse URL: %v", err)
+	}
+	b := NewBackend(u, 200*time.Millisecond)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				if i%2 == 0 {
+					b.SetAlive(true)
+				} else {
+					b.SetAlive(false)
+				}
+				_ = b.IsAlive()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestNext_ConcurrentDistribution(t *testing.T) {
+	// Next() must distribute requests evenly across healthy backends even under concurrent calls.
+	b1 := newControllableBackend(t, "backend-1")
+	b2 := newControllableBackend(t, "backend-2")
+	b3 := newControllableBackend(t, "backend-3")
+	defer b1.Close()
+	defer b2.Close()
+	defer b3.Close()
+
+	pool := newPoolFromBackends(t, b1, b2, b3)
+	var counts [3]atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 300; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b := pool.Next()
+			if b == nil {
+				return
+			}
+			switch b.URL.String() {
+			case b1.Target():
+				counts[0].Add(1)
+			case b2.Target():
+				counts[1].Add(1)
+			case b3.Target():
+				counts[2].Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < len(counts); i++ {
+		if got := counts[i].Load(); got != 100 {
+			t.Fatalf("backend %d selected %d times; want 100", i+1, got)
+		}
+	}
+}
+
+func TestNext_NeverReturnsDeadBackend(t *testing.T) {
+	// A permanently dead backend should never be selected by Next(), even while other backends flip state.
+	b1 := newControllableBackend(t, "backend-1")
+	b2 := newControllableBackend(t, "backend-2")
+	b3 := newControllableBackend(t, "backend-3")
+	defer b1.Close()
+	defer b2.Close()
+	defer b3.Close()
+
+	pool := newPoolFromBackends(t, b1, b2, b3)
+	pool.backends[0].SetAlive(false)
+
+	var deadReturned atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			if i%2 == 0 {
+				pool.backends[1].SetAlive(true)
+			} else {
+				pool.backends[1].SetAlive(false)
+			}
+		}
+	}()
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				b := pool.Next()
+				if b == pool.backends[0] {
+					deadReturned.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := deadReturned.Load(); got != 0 {
+		t.Fatalf("Next returned the permanently dead backend %d times; want 0", got)
 	}
 }
