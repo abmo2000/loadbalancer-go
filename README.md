@@ -86,6 +86,50 @@ The configuration layer validates the final values before startup:
 
 Use `go run ./cmd/lb -h` to print the built-in usage text and defaults.
 
+## Validation
+
+Configuration is validated before the pool or HTTP server is started. Invalid settings fail fast at startup rather than surfacing on the first client request.
+
+| Setting | Rule | Error condition |
+| --- | --- | --- |
+| `LB_LISTEN_ADDR` | Must be `host:port`; host is empty, an IP address, or a valid hostname; port is numeric and in `1..65535`. | Invalid address, host, or port; port `0` is not accepted for the application listener. |
+| `LB_BACKENDS` | Must contain at least one URL using `http` or `https`, with a hostname and no user information. | Missing backend, unsupported scheme, empty/invalid hostname, or `user:pass@` information. |
+| `LB_BACKENDS` | Backend URLs must not have a query, fragment, or path other than empty or `/`. | The URL includes `?query`, `#fragment`, or a path such as `/api`. |
+| `LB_BACKENDS` | A supplied port must be numeric and in `1..65535`; omitted ports use HTTP `80` or HTTPS `443`. | Port is malformed or outside the allowed range. |
+| `LB_BACKENDS` | URLs are compared after lowercasing scheme/host, removing `/`, and applying default ports. | Duplicate normalized backend URLs are rejected. |
+| `LB_BACKENDS` | A local backend must not use the balancer's listen port. | A backend on `localhost`, `127.0.0.1`, `::1`, or `0.0.0.0` would proxy back to this balancer. |
+| `LB_HEALTH_INTERVAL`, `LB_HEALTH_TIMEOUT`, `LB_DIAL_TIMEOUT`, `LB_RESPONSE_TIMEOUT`, `LB_READ_HEADER_TIMEOUT`, `LB_READ_TIMEOUT`, `LB_WRITE_TIMEOUT`, `LB_IDLE_TIMEOUT`, `LB_SHUTDOWN_TIMEOUT` | Each duration must parse, be greater than zero, and be no more than `24h`. | Invalid, zero, negative, or excessive duration. |
+| `LB_HEALTH_TIMEOUT` | Must be less than `LB_HEALTH_INTERVAL`. | Health checks could overlap. |
+| `LB_DIAL_TIMEOUT` | Must be less than or equal to `LB_RESPONSE_TIMEOUT`. | The dial budget exceeds the overall response-header budget. |
+| `LB_READ_HEADER_TIMEOUT` | Must be less than or equal to `LB_READ_TIMEOUT`. | The header-read budget exceeds the server read budget. |
+| `LB_SHUTDOWN_TIMEOUT` | May be any otherwise-valid duration; a value shorter than `LB_RESPONSE_TIMEOUT` is allowed with a warning. | Warning only: in-flight requests may be cut off during shutdown. |
+| `LB_CHECK_ONLY` | Must be a boolean when set. | Value is not `true` or `false`. |
+
+Configuration errors are printed to stderr with the `config error:` prefix and exit with status `2`. Warnings use the `warning:` prefix and the server continues. A listen preflight failure is printed with `preflight error:` and exits with status `1`. Preflight attempts to bind the configured address and closes it immediately; the actual server bind can still fail later if another process takes the address in between.
+
+Use the dry-run mode in CI or before deploying to validate settings and confirm the listen address is currently available without starting the balancer:
+
+```sh
+go run ./cmd/lb -check
+LB_CHECK_ONLY=true go run ./cmd/lb
+```
+
+The process does not require backends to be reachable at startup. Health checks own reachability and failover, so a temporary backend outage does not prevent the balancer from starting. During normal startup, hostname resolution is attempted with a two-second timeout per backend; resolution failures produce warnings and do not stop startup.
+
+The config tests exercise the rules directly without depending on real environment variables or backend services:
+
+- `TestValidate_ListenPorts`: accepts valid IPv4/IPv6 and empty-host listen addresses and rejects missing, nonnumeric, zero, negative, and out-of-range ports.
+- `TestValidate_BackendURLs`: checks required URL structure, forbidden URL components, port bounds, and valid HTTP/HTTPS, IPv6, and default-port forms.
+- `TestValidate_BackendNormalizationAndDuplicates`: detects case/slash and implicit/explicit default-port duplicates and verifies stored canonical URLs.
+- `TestValidate_RejectsSelfProxy`: rejects a local backend that targets the balancer's own listen port.
+- `TestValidate_DurationBounds`: rejects zero, negative, and over-24-hour durations.
+- `TestLoadConfig_InvalidDurationNamesValue` and `TestLoadConfig_AggregatesInvalidDurations`: check helpful malformed-duration errors and report multiple bad values together.
+- `TestValidate_DurationRelationships`: checks the health, dial/response, and read-header/read timeout constraints.
+- `TestWarnings_ShutdownShorterThanResponse`: confirms the shutdown warning does not make validation fail.
+- `TestValidate_ReportsAllErrors`: confirms unrelated address, URL, and duration errors are returned together.
+- `TestPreflight`: confirms an occupied address fails preflight and an available address passes.
+- `TestLoadConfig_CheckOnly`: checks the environment setting and command-line override for dry-run mode.
+
 ## Try it
 
 Send repeated requests through the load balancer:

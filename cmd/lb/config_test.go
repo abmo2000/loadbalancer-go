@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +110,33 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_CheckOnly(t *testing.T) {
+	cfg, err := LoadConfig(envLookup(map[string]string{"LB_CHECK_ONLY": "true"}), nil)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if !cfg.CheckOnly {
+		t.Fatal("LB_CHECK_ONLY=true did not enable check-only mode")
+	}
+
+	cfg, err = LoadConfig(envLookup(map[string]string{"LB_CHECK_ONLY": "true"}), []string{"-check=false"})
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if cfg.CheckOnly {
+		t.Fatal("-check=false did not override LB_CHECK_ONLY=true")
+	}
+}
+
+func TestLoadConfig_AggregatesInvalidDurations(t *testing.T) {
+	env := map[string]string{
+		"LB_HEALTH_INTERVAL":  "abc",
+		"LB_RESPONSE_TIMEOUT": "later",
+	}
+	_, err := LoadConfig(envLookup(env), nil)
+	assertConfigError(t, err, "LB_HEALTH_INTERVAL", "abc", "LB_RESPONSE_TIMEOUT", "later")
+}
+
 func TestLoadConfig_BackendsParsing(t *testing.T) {
 	env := map[string]string{
 		"LB_BACKENDS": " http://localhost:9001 , ,http://localhost:9002, , http://localhost:9003, ",
@@ -138,7 +166,7 @@ func TestLoadConfig_InvalidDuration(t *testing.T) {
 		t.Fatal("LoadConfig returned nil error for invalid duration")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "invalid duration") || !strings.Contains(msg, "LB_HEALTH_INTERVAL") {
+	if !strings.Contains(msg, "not a valid duration") || !strings.Contains(msg, "LB_HEALTH_INTERVAL") || !strings.Contains(msg, `"abc"`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -146,7 +174,7 @@ func TestLoadConfig_InvalidDuration(t *testing.T) {
 func TestValidate_NoBackends(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Backends = nil
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "at least one backend") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "LB_BACKENDS") || !strings.Contains(err.Error(), `""`) {
 		t.Fatalf("Validate = %v; want at least one backend error", err)
 	}
 }
@@ -157,7 +185,7 @@ func TestValidate_InvalidBackendURL(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Backends = []string{tc}
 		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "invalid backend URL") {
+		if err == nil || !strings.Contains(err.Error(), "LB_BACKENDS") || !strings.Contains(err.Error(), tc) {
 			t.Fatalf("Validate(%q) = %v; want invalid backend URL error", tc, err)
 		}
 	}
@@ -167,7 +195,7 @@ func TestValidate_DuplicateBackends(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Backends = []string{"http://localhost:9001", "http://localhost:9001"}
 	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "duplicate backend URL") {
+	if err == nil || !strings.Contains(err.Error(), "LB_BACKENDS") || !strings.Contains(err.Error(), "must be unique") {
 		t.Fatalf("Validate = %v; want duplicate backend URL error", err)
 	}
 }
@@ -176,23 +204,8 @@ func TestValidate_BadListenAddr(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ListenAddr = "localhost"
 	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "listen address") {
+	if err == nil || !strings.Contains(err.Error(), "LB_LISTEN_ADDR") || !strings.Contains(err.Error(), "localhost") {
 		t.Fatalf("Validate = %v; want listen address error", err)
-	}
-}
-
-func TestValidate_ReportsAllErrors(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Backends = []string{"localhost:9001", "ftp://x"}
-	cfg.ListenAddr = "bad"
-	cfg.HealthInterval = 0
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate returned nil error for multiple invalid values")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "invalid backend URL") || !strings.Contains(msg, "health interval") || !strings.Contains(msg, "listen address") {
-		t.Fatalf("unexpected multi-error output: %v", err)
 	}
 }
 
@@ -203,5 +216,238 @@ func TestLoadConfig_HelpFlag(t *testing.T) {
 	}
 	if cfg.ListenAddr == "" {
 		t.Fatal("LoadConfig should still return a config on help")
+	}
+}
+
+func TestValidate_ListenPorts(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		valid   bool
+	}{
+		{"zero", ":0", false},
+		{"too high", ":70000", false},
+		{"nonnumeric", ":abc", false},
+		{"missing colon", "8080", false},
+		{"negative", ":-1", false},
+		{"port only", ":8080", true},
+		{"hostname", "localhost:8080", true},
+		{"ipv4 host", "127.0.0.1:8080", true},
+		{"ipv6 host", "[::1]:8080", true},
+		{"host with spaces", "bad host:8080", false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.ListenAddr = test.address
+			err := cfg.Validate()
+			if test.valid && err != nil {
+				t.Fatalf("Validate returned error for %q: %v", test.address, err)
+			}
+			if !test.valid {
+				assertConfigError(t, err, "LB_LISTEN_ADDR", test.address)
+			}
+		})
+	}
+}
+
+func TestValidate_BackendURLs(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{"missing scheme", "localhost:9001", false},
+		{"unsupported scheme", "ftp://x", false},
+		{"missing host", "http://", false},
+		{"userinfo", "http://user:pass@localhost:9001", false},
+		{"query", "http://localhost:9001?x=1", false},
+		{"fragment", "http://localhost:9001#frag", false},
+		{"empty fragment", "http://localhost:9001#", false},
+		{"path", "http://localhost:9001/api", false},
+		{"zero port", "http://localhost:0", false},
+		{"high port", "http://localhost:99999", false},
+		{"nonnumeric port", "http://localhost:abc", false},
+		{"trailing slash", "http://localhost:9001/", true},
+		{"uppercase host", "http://LOCALHOST:9001", true},
+		{"https", "https://example.com:8443", true},
+		{"https default port", "https://example.com", true},
+		{"ipv6", "http://[::1]:9001", true},
+		{"default port", "http://example.com", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Backends = []string{test.value}
+			err := cfg.Validate()
+			if test.valid && err != nil {
+				t.Fatalf("Validate rejected %q: %v", test.value, err)
+			}
+			if !test.valid {
+				assertConfigError(t, err, "LB_BACKENDS", test.value)
+			}
+		})
+	}
+}
+
+func TestValidate_BackendNormalizationAndDuplicates(t *testing.T) {
+	tests := []struct {
+		name     string
+		backends []string
+		want     string
+	}{
+		{
+			name:     "case and slash",
+			backends: []string{"http://Localhost:9001/", "http://localhost:9001"},
+			want:     "http://localhost:9001",
+		},
+		{
+			name:     "implicit default port",
+			backends: []string{"http://example.com", "http://example.com:80"},
+			want:     "http://example.com:80",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Backends = append([]string(nil), test.backends...)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "must be unique") {
+				t.Fatalf("Validate = %v; want duplicate backend error", err)
+			}
+			for _, backend := range cfg.Backends {
+				if backend != test.want {
+					t.Fatalf("normalized backend = %q; want %q", backend, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestValidate_RejectsSelfProxy(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = ":8080"
+	cfg.Backends = []string{"http://localhost:8080"}
+	err := cfg.Validate()
+	assertConfigError(t, err, "LB_BACKENDS", "http://localhost:8080")
+	if !strings.Contains(err.Error(), "this balancer") {
+		t.Fatalf("Validate error = %v; want self-proxy explanation", err)
+	}
+}
+
+func TestValidate_DurationBounds(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value time.Duration
+	}{
+		{"health interval zero", "LB_HEALTH_INTERVAL", 0},
+		{"dial timeout negative", "LB_DIAL_TIMEOUT", -time.Second},
+		{"response timeout over limit", "LB_RESPONSE_TIMEOUT", 25 * time.Hour},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			switch test.field {
+			case "LB_HEALTH_INTERVAL":
+				cfg.HealthInterval = test.value
+			case "LB_DIAL_TIMEOUT":
+				cfg.DialTimeout = test.value
+			case "LB_RESPONSE_TIMEOUT":
+				cfg.ResponseTimeout = test.value
+			}
+			assertConfigError(t, cfg.Validate(), test.field, test.value.String())
+		})
+	}
+}
+
+func TestLoadConfig_InvalidDurationNamesValue(t *testing.T) {
+	_, err := LoadConfig(envLookup(map[string]string{"LB_RESPONSE_TIMEOUT": "abc"}), nil)
+	assertConfigError(t, err, "LB_RESPONSE_TIMEOUT", "abc")
+}
+
+func TestValidate_DurationRelationships(t *testing.T) {
+	tests := []struct {
+		name   string
+		field  string
+		value  string
+		mutate func(*Config)
+	}{
+		{"health timeout overlaps interval", "LB_HEALTH_TIMEOUT", "1s", func(c *Config) { c.HealthInterval = time.Second; c.HealthTimeout = time.Second }},
+		{"dial exceeds response", "LB_DIAL_TIMEOUT", "11s", func(c *Config) { c.DialTimeout = 11 * time.Second; c.ResponseTimeout = 10 * time.Second }},
+		{"header exceeds read", "LB_READ_HEADER_TIMEOUT", "16s", func(c *Config) { c.ReadHeaderTimeout = 16 * time.Second; c.ReadTimeout = 15 * time.Second }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			test.mutate(&cfg)
+			assertConfigError(t, cfg.Validate(), test.field, test.value, "must be")
+		})
+	}
+}
+
+func TestWarnings_ShutdownShorterThanResponse(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ShutdownTimeout = 5 * time.Second
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+	warnings := cfg.Warnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "LB_SHUTDOWN_TIMEOUT") || !strings.Contains(warnings[0], "5s") || !strings.Contains(warnings[0], "LB_RESPONSE_TIMEOUT") || !strings.Contains(warnings[0], "10s") {
+		t.Fatalf("Warnings = %#v; want shutdown/response warning", warnings)
+	}
+}
+
+func TestValidate_ReportsAllErrors(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = ":0"
+	cfg.Backends = []string{"ftp://host?query=1"}
+	cfg.HealthInterval = 0
+	cfg.WriteTimeout = 25 * time.Hour
+	err := cfg.Validate()
+	for _, expected := range []string{"LB_LISTEN_ADDR", `":0"`, "LB_BACKENDS", `"ftp://host?query=1"`, "LB_HEALTH_INTERVAL", `"0s"`, "LB_WRITE_TIMEOUT", `"25h0m0s"`} {
+		if err == nil || !strings.Contains(err.Error(), expected) {
+			t.Fatalf("Validate error = %v; want all errors including %s", err, expected)
+		}
+	}
+}
+
+func TestPreflight(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+	occupiedConfig := DefaultConfig()
+	occupiedConfig.ListenAddr = occupied.Addr().String()
+	if err := Preflight(occupiedConfig); err == nil || !strings.Contains(err.Error(), "cannot listen on") {
+		t.Fatalf("Preflight on occupied address = %v; want listen failure", err)
+	}
+
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = free.Close() })
+	freeConfig := DefaultConfig()
+	freeConfig.ListenAddr = free.Addr().String()
+	if err := free.Close(); err != nil {
+		t.Fatalf("closing reservation listener: %v", err)
+	}
+	if err := Preflight(freeConfig); err != nil {
+		t.Fatalf("Preflight on free address returned error: %v", err)
+	}
+}
+
+func assertConfigError(t *testing.T, err error, expected ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected error containing %q", expected)
+	}
+	message := err.Error()
+	for _, value := range expected {
+		if !strings.Contains(message, value) {
+			t.Fatalf("error %q does not contain %q", message, value)
+		}
 	}
 }

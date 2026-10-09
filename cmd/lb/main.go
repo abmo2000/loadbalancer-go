@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -202,6 +203,29 @@ func runServerWithListener(ctx context.Context, srv *http.Server, shutdownTimeou
 	})
 }
 
+func printProblems(prefix string, err error) {
+	for _, problem := range strings.Split(err.Error(), "\n") {
+		if problem != "" {
+			fmt.Fprintf(os.Stderr, "%s%s\n", prefix, problem)
+		}
+	}
+}
+
+func warnUnresolvableBackends(backends []string) {
+	for _, backend := range backends {
+		u, err := url.Parse(backend)
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err = net.DefaultResolver.LookupHost(ctx, u.Hostname())
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: backend %q hostname %q could not be resolved: %v\n", backend, u.Hostname(), err)
+		}
+	}
+}
+
 func main() {
 	env := func(name string) string {
 		if value, ok := os.LookupEnv(name); ok {
@@ -214,13 +238,24 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
+	err = errors.Join(err, cfg.Validate())
+	if err != nil {
+		printProblems("config error: ", err)
 		os.Exit(2)
 	}
-	if err := cfg.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(2)
+	for _, warning := range cfg.Warnings() {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
 	}
+	if err := Preflight(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "preflight error: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.CheckOnly {
+		fmt.Println("config OK")
+		return
+	}
+	warnUnresolvableBackends(cfg.Backends)
 	log.Println(cfg.String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
