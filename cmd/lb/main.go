@@ -20,10 +20,18 @@ import (
 )
 
 type Backend struct {
-	URL   *url.URL
-	Proxy *httputil.ReverseProxy
-	mu    sync.RWMutex
-	alive bool
+	URL                 *url.URL
+	Proxy               *httputil.ReverseProxy
+	mu                  sync.RWMutex
+	alive               bool
+	activeConns         atomic.Int64
+	totalRequests       atomic.Uint64
+	totalFailures       atomic.Uint64
+	consecutiveFailures atomic.Uint64
+	lastCheck           time.Time
+	lastError           string
+	addedAt             time.Time
+	transport           *http.Transport
 }
 
 func NewBackend(u *url.URL, args ...time.Duration) *Backend {
@@ -37,20 +45,21 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 		responseTimeout = args[1]
 	}
 
-	b := &Backend{URL: u, alive: true}
+	b := &Backend{URL: u, alive: true, addedAt: time.Now()}
 	b.Proxy = httputil.NewSingleHostReverseProxy(u)
-	b.Proxy.Transport = &http.Transport{
+	b.transport = &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
 		ResponseHeaderTimeout: responseTimeout,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   100,
 	}
+	b.Proxy.Transport = b.transport
 	b.Proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
 		log.Printf("proxy error for %s: %v", b.URL, err)
-		b.SetAlive(false)
+		b.recordProxyFailure(err)
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 	}
 	return b
@@ -68,8 +77,50 @@ func (b *Backend) IsAlive() bool {
 	return b.alive
 }
 
+func (b *Backend) recordProxyFailure(err error) {
+	b.totalFailures.Add(1)
+	b.consecutiveFailures.Add(1)
+	b.mu.Lock()
+	b.alive = false
+	b.lastError = err.Error()
+	b.mu.Unlock()
+}
+
+func (b *Backend) recordHealthCheck(alive bool, checkErr error) bool {
+	b.mu.Lock()
+	changed := b.alive != alive
+	b.alive = alive
+	b.lastCheck = time.Now()
+	if checkErr != nil {
+		b.lastError = checkErr.Error()
+		b.consecutiveFailures.Add(1)
+	} else {
+		b.lastError = ""
+		b.consecutiveFailures.Store(0)
+	}
+	b.mu.Unlock()
+	return changed
+}
+
+func (b *Backend) status() BackendStatus {
+	b.mu.RLock()
+	status := BackendStatus{
+		URL:                 b.URL.String(),
+		Alive:               b.alive,
+		ConsecutiveFailures: b.consecutiveFailures.Load(),
+		LastCheck:           b.lastCheck,
+		LastError:           b.lastError,
+		AddedAt:             b.addedAt,
+	}
+	b.mu.RUnlock()
+	status.TotalRequests = b.totalRequests.Load()
+	status.TotalFailures = b.totalFailures.Load()
+	status.ActiveConns = b.activeConns.Load()
+	return status
+}
+
 type Pool struct {
-	backends      []*Backend
+	registry      *Registry
 	counter       uint64
 	healthTimeout time.Duration
 }
@@ -84,25 +135,24 @@ func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
 		dialTimeout = args[0]
 		responseTimeout = args[1]
 	}
-	pool := &Pool{healthTimeout: 2 * time.Second}
+	registry := NewRegistry(responseTimeout, dialTimeout)
 	for _, target := range targets {
-		u, err := url.Parse(target)
-		if err != nil {
+		if _, err := registry.Add(target); err != nil {
 			return nil, err
 		}
-		pool.backends = append(pool.backends, NewBackend(u, dialTimeout, responseTimeout))
 	}
-	return pool, nil
+	return &Pool{registry: registry, healthTimeout: 2 * time.Second}, nil
 }
 
 func (p *Pool) Next() *Backend {
-	n := uint64(len(p.backends))
+	backends := p.registry.snapshot()
+	n := uint64(len(backends))
 	if n == 0 {
 		return nil
 	}
 	start := atomic.AddUint64(&p.counter, 1)
 	for i := uint64(0); i < n; i++ {
-		b := p.backends[(start+i)%n]
+		b := backends[(start+i)%n]
 		if b.IsAlive() {
 			return b
 		}
@@ -116,16 +166,19 @@ func (p *Pool) CheckOnce() {
 		timeout = 2 * time.Second
 	}
 	client := http.Client{Timeout: timeout}
-	for _, b := range p.backends {
+	for _, b := range p.registry.snapshot() {
 		resp, err := client.Get(b.URL.String())
 		alive := err == nil && resp.StatusCode < 500
+		checkErr := err
 		if err == nil {
+			if resp.StatusCode >= 500 {
+				checkErr = fmt.Errorf("health check returned HTTP status %d", resp.StatusCode)
+			}
 			_ = resp.Body.Close()
 		}
-		if alive != b.IsAlive() {
+		if b.recordHealthCheck(alive, checkErr) {
 			log.Printf("backend %s alive=%v", b.URL, alive)
 		}
-		b.SetAlive(alive)
 	}
 }
 
@@ -153,6 +206,9 @@ func (p *Pool) Handler() http.Handler {
 			http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 			return
 		}
+		b.totalRequests.Add(1)
+		b.activeConns.Add(1)
+		defer b.activeConns.Add(-1)
 		b.Proxy.ServeHTTP(w, r)
 	})
 }
@@ -170,10 +226,7 @@ func runServerWithServeFunc(ctx context.Context, srv *http.Server, shutdownTimeo
 
 	select {
 	case err := <-serverErr:
-		if err != nil {
-			return err
-		}
-		return nil
+		return err
 	case <-ctx.Done():
 		log.Println("shutdown signal received")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)

@@ -232,6 +232,46 @@ The new shutdown tests cover the following behaviors:
 - `TestHealthCheckStopsOnContextCancel`: verifies the health-check loop exits on context cancellation.
 - `TestGracefulShutdown_NoRequests`: verifies an idle server shuts down promptly without activity.
 
+## Backend registry (Phase 1)
+
+The registry is the single source of truth for backend objects and their runtime state. `Pool` uses it for selection, while health checks update the same backend records. It provides the foundation for later runtime configuration and an admin API; no admin endpoints are included in this phase.
+
+```text
+                 +--> Pool (selection) --> Handler
+Config --> Registry
+                 +--> HealthCheck
+```
+
+The backend slice is published through an atomic pointer to an immutable snapshot. Requests and health checks load the current snapshot without taking a registry lock; Add and Remove serialize under a mutex and publish a copied slice. This favors frequent reads and infrequent updates. The tradeoff is allocation and copying proportional to the number of registered backends on each update.
+
+Removing a backend prevents future snapshots from selecting or checking it and closes its idle transport connections. A request that already selected the backend keeps its pointer and is allowed to finish; removal does not cancel in-flight work.
+
+`BackendStatus` is a copied, JSON-friendly snapshot:
+
+- `URL`: normalized backend base URL.
+- `Alive`: current health state used by selection.
+- `ConsecutiveFailures`: successive proxy or health-check failures, reset after a successful health check.
+- `TotalRequests`: requests sent through the backend proxy.
+- `TotalFailures`: proxy failures reported by the reverse proxy error handler.
+- `ActiveConns`: requests currently being proxied through the backend.
+- `LastCheck`: time of the most recent health check.
+- `LastError`: most recent proxy or health-check error, cleared by a successful health check.
+- `AddedAt`: time the backend was registered.
+
+Registry changes are in memory only and are lost when the process restarts. There is no failure threshold yet: a proxy failure marks the backend unhealthy, and the next successful health check restores it.
+
+The registry tests cover these guarantees:
+
+- `TestRegistryAddAndNormalize`: stores normalized URLs and rejects invalid or duplicate backends with sentinel errors.
+- `TestRegistryRemoveInFlight`: removes a backend from selection while an already-started request still completes.
+- `TestRegistryListSnapshotAndOrder`: proves returned status values are detached copies and retain insertion order.
+- `TestRegistrySetAliveAndHealthy`: verifies explicit health updates are reflected by `Healthy()`.
+- `TestPoolDynamicRoundRobin`: checks an added backend joins rotation and a removed backend stops receiving new requests.
+- `TestPoolHealthCheckIncludesAddedBackend`: verifies a later health check examines a backend added after pool creation.
+- `TestBackendCountersAndHealthRecovery`: checks request/failure/active counters and recovery after a successful health check.
+- `TestRegistryRaceConcurrentChanges`: exercises concurrent requests, add/remove, status listing, and health checks.
+- `TestPoolEmptyRegistry`: confirms an empty registry selects no backend and responds with 503.
+
 ## Design notes
 
 - A single timeout marks a backend dead until the next health check. This is a deliberate simplification for the demo implementation.

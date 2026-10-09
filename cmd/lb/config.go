@@ -169,69 +169,19 @@ func (c *Config) Validate() error {
 
 	seen := make(map[string]string, len(c.Backends))
 	for index, raw := range c.Backends {
-		u, err := url.Parse(raw)
+		normalized, u, err := normalizeBackendURL(raw)
 		if err != nil {
-			if strings.Contains(err.Error(), "port") {
-				problems = append(problems, fmt.Errorf("LB_BACKENDS: %q has an invalid port; use a numeric port from 1 to 65535", raw))
-			} else {
-				problems = append(problems, fmt.Errorf("LB_BACKENDS: %q is not a valid URL: %v", raw, err))
-			}
+			problems = append(problems, err)
 			continue
 		}
 
-		backendProblems := make([]error, 0)
-		scheme := strings.ToLower(u.Scheme)
-		if scheme != "http" && scheme != "https" {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q must use the http or https scheme", raw))
-		}
-		if u.Hostname() == "" {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q must include a non-empty hostname", raw))
-		} else if !validHost(u.Hostname()) {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q has an invalid hostname; use an IP address or hostname without spaces", raw))
-		}
-		if u.User != nil {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q must not contain user information", raw))
-		}
-		if u.RawQuery != "" || u.ForceQuery {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q must not contain a query string", raw))
-		}
-		if strings.Contains(raw, "#") || u.Fragment != "" || u.RawFragment != "" {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q must not contain a fragment", raw))
-		}
-		if u.Path != "" && u.Path != "/" {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q must be a base address with an empty path or /", raw))
-		}
-
-		port := u.Port()
-		if strings.HasSuffix(u.Host, ":") {
-			backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q has an empty port; use a numeric port from 1 to 65535", raw))
-		} else if port != "" {
-			parsedPort, portErr := parsePort(port)
-			if portErr != nil {
-				backendProblems = append(backendProblems, fmt.Errorf("LB_BACKENDS: %q has an invalid port %q; use a numeric port from 1 to 65535", raw, port))
-			} else {
-				port = strconv.Itoa(parsedPort)
-			}
-		} else if scheme == "http" {
-			port = "80"
-		} else if scheme == "https" {
-			port = "443"
-		}
-
-		if len(backendProblems) > 0 {
-			problems = append(problems, backendProblems...)
-			continue
-		}
-
-		host := strings.ToLower(u.Hostname())
-		normalized := scheme + "://" + net.JoinHostPort(host, port)
 		c.Backends[index] = normalized
 		if previous, ok := seen[normalized]; ok {
 			problems = append(problems, fmt.Errorf("LB_BACKENDS: %q duplicates %q after URL normalization; each backend must be unique", raw, previous))
 		} else {
 			seen[normalized] = raw
 		}
-		if listenValid && (listenHost == "" || localHost(listenHost)) && localHost(host) && port == strconv.Itoa(listenPort) {
+		if listenValid && (listenHost == "" || localHost(listenHost)) && localHost(u.Hostname()) && u.Port() == strconv.Itoa(listenPort) {
 			problems = append(problems, fmt.Errorf("LB_BACKENDS: %q points to this balancer on listen port %d; choose a different backend address or port", raw, listenPort))
 		}
 	}
@@ -269,6 +219,66 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(problems...)
+}
+
+func normalizeBackendURL(raw string) (string, *url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		if strings.Contains(err.Error(), "port") {
+			return "", nil, fmt.Errorf("LB_BACKENDS: %q has an invalid port; use a numeric port from 1 to 65535", raw)
+		}
+		return "", nil, fmt.Errorf("LB_BACKENDS: %q is not a valid URL: %v", raw, err)
+	}
+
+	problems := make([]error, 0)
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must use the http or https scheme", raw))
+	}
+	if u.Hostname() == "" {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must include a non-empty hostname", raw))
+	} else if !validHost(u.Hostname()) {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q has an invalid hostname; use an IP address or hostname without spaces", raw))
+	}
+	if u.User != nil {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must not contain user information", raw))
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must not contain a query string", raw))
+	}
+	if strings.Contains(raw, "#") || u.Fragment != "" || u.RawFragment != "" {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must not contain a fragment", raw))
+	}
+	if u.Path != "" && u.Path != "/" {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must be a base address with an empty path or /", raw))
+	}
+
+	port := u.Port()
+	if strings.HasSuffix(u.Host, ":") {
+		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q has an empty port; use a numeric port from 1 to 65535", raw))
+	} else if port != "" {
+		parsedPort, portErr := parsePort(port)
+		if portErr != nil {
+			problems = append(problems, fmt.Errorf("LB_BACKENDS: %q has an invalid port %q; use a numeric port from 1 to 65535", raw, port))
+		} else {
+			port = strconv.Itoa(parsedPort)
+		}
+	} else if scheme == "http" {
+		port = "80"
+	} else if scheme == "https" {
+		port = "443"
+	}
+	if len(problems) != 0 {
+		return "", nil, errors.Join(problems...)
+	}
+
+	host := strings.ToLower(u.Hostname())
+	normalized := scheme + "://" + net.JoinHostPort(host, port)
+	parsed, err := url.Parse(normalized)
+	if err != nil {
+		return "", nil, fmt.Errorf("LB_BACKENDS: %q could not be normalized: %v", raw, err)
+	}
+	return normalized, parsed, nil
 }
 
 func validateListenAddr(address string) (string, int, bool, []error) {

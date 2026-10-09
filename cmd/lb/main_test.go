@@ -213,7 +213,11 @@ func TestFailover(t *testing.T) {
 	pool := newPoolFromBackends(t, b1, b2, b3)
 	b1.SetHealthy(false)
 	pool.CheckOnce()
-	if pool.backends[0].IsAlive() {
+	backend1, ok := pool.registry.Get(b1.Target())
+	if !ok {
+		t.Fatal("backend-1 is missing from the registry")
+	}
+	if backend1.IsAlive() {
 		t.Fatal("backend-1 should be marked dead after the health check")
 	}
 
@@ -264,7 +268,11 @@ func TestFailover_PassiveDetection(t *testing.T) {
 	if failures != 1 {
 		t.Fatalf("got %d failed requests from the closed backend; want 1", failures)
 	}
-	if pool.backends[0].IsAlive() {
+	backend1, ok := pool.registry.Get(b1.Target())
+	if !ok {
+		t.Fatal("backend-1 is missing from the registry")
+	}
+	if backend1.IsAlive() {
 		t.Fatal("closed backend should be marked dead after the passive proxy error")
 	}
 }
@@ -700,8 +708,13 @@ func TestNext_NeverReturnsDeadBackend(t *testing.T) {
 	defer b3.Close()
 
 	pool := newPoolFromBackends(t, b1, b2, b3)
-	pool.backends[0].SetAlive(false)
-
+	backend1, ok := pool.registry.Get(b1.Target())
+	if !ok {
+		t.Fatal("backend-1 is missing from the registry")
+	}
+	if err := pool.registry.SetAlive(b1.Target(), false); err != nil {
+		t.Fatalf("SetAlive backend-1: %v", err)
+	}
 	var deadReturned atomic.Int32
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -709,9 +722,9 @@ func TestNext_NeverReturnsDeadBackend(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 1000; i++ {
 			if i%2 == 0 {
-				pool.backends[1].SetAlive(true)
+				_ = pool.registry.SetAlive(b2.Target(), true)
 			} else {
-				pool.backends[1].SetAlive(false)
+				_ = pool.registry.SetAlive(b2.Target(), false)
 			}
 		}
 	}()
@@ -722,7 +735,7 @@ func TestNext_NeverReturnsDeadBackend(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 500; j++ {
 				b := pool.Next()
-				if b == pool.backends[0] {
+				if b == backend1 {
 					deadReturned.Add(1)
 				}
 			}
