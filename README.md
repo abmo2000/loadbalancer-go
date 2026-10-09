@@ -105,6 +105,33 @@ The race detector only reports races that actually execute, so these tests delib
 
 `main()` was split into `NewBackend`, `NewPool`, `CheckOnce`, and `Handler` so the load balancer could be constructed and exercised in tests without starting a network listener. This keeps the program behavior the same while making the logic testable as plain Go code. The proxying, health checks, failover behavior, and timeout handling were not changed.
 
+## Graceful shutdown
+
+The load balancer listens for `SIGINT` and `SIGTERM` through `signal.NotifyContext`. On shutdown, it stops accepting new connections, waits for in-flight requests to finish, and then exits cleanly. If the graceful shutdown deadline is reached, it calls `Shutdown` with a timeout and then `Close` to force-close any remaining connections. This prevents the process from exiting immediately while a request is still being served.
+
+The `-shutdown-timeout` flag is defined in `main()` and defaults to `15s`. Choose a value that is longer than the slowest normal request but shorter than the orchestrator’s kill timeout; for Kubernetes, this is usually bounded by `terminationGracePeriodSeconds`.
+
+The health check goroutine also stops through context cancellation. When the main context is canceled, the ticker loop exits cleanly instead of continuing to probe the backends.
+
+The standard library has a known limitation: `http.Server.Shutdown` does not wait for hijacked connections such as WebSockets. In a real deployment, the load balancer in front should stop sending traffic before the backend process is terminated.
+
+Manual verification:
+
+```sh
+./start.sh
+curl http://localhost:8080/slow
+```
+
+While the request is still in progress, press `Ctrl+C` in the balancer terminal. The request should finish, and the logs should show `shutdown signal received` followed by `shutdown complete`.
+
+The new shutdown tests cover the following behaviors:
+
+- `TestGracefulShutdown_FinishesInFlightRequest`: verifies an in-flight request completes during shutdown.
+- `TestGracefulShutdown_RejectsNewRequests`: verifies new requests fail after shutdown begins while the earlier request still completes.
+- `TestGracefulShutdown_TimeoutForcesClose`: verifies a shutdown timeout returns an error instead of hanging.
+- `TestHealthCheckStopsOnContextCancel`: verifies the health-check loop exits on context cancellation.
+- `TestGracefulShutdown_NoRequests`: verifies an idle server shuts down promptly without activity.
+
 ## Design notes
 
 - A single timeout marks a backend dead until the next health check. This is a deliberate simplification for the demo implementation.

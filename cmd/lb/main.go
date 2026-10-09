@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -99,12 +103,21 @@ func (p *Pool) CheckOnce() {
 	}
 }
 
-func (p *Pool) HealthCheck(interval time.Duration) {
+func (p *Pool) HealthCheckContext(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		p.CheckOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.CheckOnce()
+		}
 	}
+}
+
+func (p *Pool) HealthCheck(interval time.Duration) {
+	p.HealthCheckContext(context.Background(), interval)
 }
 
 func (p *Pool) Handler() http.Handler {
@@ -118,7 +131,53 @@ func (p *Pool) Handler() http.Handler {
 	})
 }
 
+func runServerWithServeFunc(ctx context.Context, srv *http.Server, shutdownTimeout time.Duration, serve func() error) error {
+	serverErr := make(chan error, 1)
+	go func() {
+		err := serve()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		log.Println("shutdown signal received")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("shutdown timeout hit after %s", shutdownTimeout)
+				_ = srv.Close()
+				return err
+			}
+			return err
+		}
+		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
+}
+
+func runServer(ctx context.Context, srv *http.Server, shutdownTimeout time.Duration) error {
+	return runServerWithServeFunc(ctx, srv, shutdownTimeout, srv.ListenAndServe)
+}
+
 func main() {
+	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "time allowed for graceful shutdown")
+	flag.Parse()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	targets := []string{
 		"http://localhost:9001",
 		"http://localhost:9002",
@@ -130,7 +189,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	go pool.HealthCheck(5 * time.Second)
+	go pool.HealthCheckContext(ctx, 5*time.Second)
 
 	srv := &http.Server{
 		Addr:              ":8080",
@@ -142,5 +201,9 @@ func main() {
 	}
 
 	log.Println("load balancer listening on :8080")
-	log.Fatal(srv.ListenAndServe())
+	if err := runServer(ctx, srv, *shutdownTimeout); err != nil {
+		log.Printf("server shutdown error: %v", err)
+		os.Exit(1)
+	}
+	log.Println("shutdown complete")
 }
