@@ -211,6 +211,8 @@ The `-shutdown-timeout` flag is defined in `main()` and defaults to `15s`. Choos
 
 The health check goroutine also stops through context cancellation. When the main context is canceled, the ticker loop exits cleanly instead of continuing to probe the backends.
 
+`start.sh` builds the backend and load-balancer executables once, then runs those binaries directly. This avoids a `go run` wrapper between the script and the balancer, so the script can signal and wait on the actual server process. On `SIGINT` or `SIGTERM`, the script forwards the signal to the balancer and waits for graceful shutdown before its `EXIT` cleanup stops the backends. Keeping the backends alive during that wait lets in-flight proxied requests finish against their upstreams.
+
 The standard library has a known limitation: `http.Server.Shutdown` does not wait for hijacked connections such as WebSockets. In a real deployment, the load balancer in front should stop sending traffic before the backend process is terminated.
 
 Manual verification:

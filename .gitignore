@@ -2,6 +2,7 @@
 /backend
 /lb
 *.exe
+/bin/
 
 # local config and secrets
 .env
