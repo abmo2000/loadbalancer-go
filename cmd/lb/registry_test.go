@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -200,9 +203,11 @@ func TestPoolHealthCheckIncludesAddedBackend(t *testing.T) {
 	if _, err := registry.Add(dead.URL); err != nil {
 		t.Fatalf("Add backend: %v", err)
 	}
-	pool.CheckOnce()
+	for range 3 {
+		pool.CheckOnce()
+	}
 	statuses := registry.List()
-	if len(statuses) != 1 || statuses[0].Alive || statuses[0].ConsecutiveFailures != 1 || statuses[0].LastCheck.IsZero() || statuses[0].LastError == "" {
+	if len(statuses) != 1 || statuses[0].Alive || statuses[0].ConsecutiveFailures != 3 || statuses[0].LastCheck.IsZero() || statuses[0].LastError == "" {
 		t.Fatalf("new backend health status = %#v; want newly checked dead backend", statuses)
 	}
 }
@@ -224,8 +229,12 @@ func TestBackendCountersAndHealthRecovery(t *testing.T) {
 	if status.TotalRequests != requests || status.ActiveConns != 0 || status.TotalFailures != 0 {
 		t.Fatalf("healthy counters = %#v; want requests=%d, active=0, failures=0", status, requests)
 	}
-	backend.recordProxyFailure(errors.New("synthetic backend failure"))
-	pool.CheckOnce()
+	for range 3 {
+		backend.recordProxyFailure(errors.New("synthetic backend failure"))
+	}
+	for range 2 {
+		pool.CheckOnce()
+	}
 	status = backend.status()
 	if !status.Alive || status.ConsecutiveFailures != 0 || status.LastError != "" {
 		t.Fatalf("successful health check did not reset failure state: %#v", status)
@@ -358,5 +367,405 @@ func waitRegistryResult[T any](t *testing.T, result <-chan T, what string) T {
 		t.Fatalf("timed out waiting for %s", what)
 		var zero T
 		return zero
+	}
+}
+
+func TestHealthFailureThresholdAndReset(t *testing.T) {
+	backendServer := newControllableBackend(t, "healthy")
+	defer backendServer.Close()
+	pool, err := NewPool([]string{backendServer.Target()}, time.Second)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(time.Second, 3, 2, "/")
+	backend, _ := pool.registry.Get(backendServer.Target())
+
+	backendServer.SetHealthy(false)
+	for expected := uint64(1); expected <= 2; expected++ {
+		pool.CheckOnce()
+		status := backend.status()
+		if !status.Alive || status.ConsecutiveFailures != expected {
+			t.Fatalf("after failure %d status = %#v; want alive with %d failures", expected, status, expected)
+		}
+	}
+
+	backendServer.SetHealthy(true)
+	pool.CheckOnce()
+	if got := backend.status().ConsecutiveFailures; got != 0 {
+		t.Fatalf("success did not reset consecutive failures: got %d", got)
+	}
+	backendServer.SetHealthy(false)
+	for range 2 {
+		pool.CheckOnce()
+	}
+	if !backend.IsAlive() {
+		t.Fatal("two post-reset failures marked backend dead")
+	}
+	pool.CheckOnce()
+	if backend.IsAlive() {
+		t.Fatal("third consecutive failure did not mark backend dead")
+	}
+}
+
+func TestHealthRecoveryThresholdAndFlapping(t *testing.T) {
+	backendServer := newControllableBackend(t, "healthy")
+	defer backendServer.Close()
+	pool, err := NewPool([]string{backendServer.Target()}, time.Second)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(time.Second, 3, 2, "/")
+	backend, _ := pool.registry.Get(backendServer.Target())
+	if err := pool.registry.SetAlive(backendServer.Target(), false); err != nil {
+		t.Fatalf("SetAlive: %v", err)
+	}
+
+	pool.CheckOnce()
+	if backend.IsAlive() || backend.status().ConsecutiveSuccesses != 1 {
+		t.Fatal("one successful check recovered a dead backend")
+	}
+	backendServer.SetHealthy(false)
+	pool.CheckOnce()
+	if backend.IsAlive() || backend.status().ConsecutiveSuccesses != 0 {
+		t.Fatal("a failure between successes did not reset recovery progress")
+	}
+	backendServer.SetHealthy(true)
+	pool.CheckOnce()
+	if backend.IsAlive() || backend.status().ConsecutiveSuccesses != 1 {
+		t.Fatal("backend recovered before two consecutive active successes")
+	}
+	pool.CheckOnce()
+	if !backend.IsAlive() {
+		t.Fatal("backend did not recover after two consecutive active successes")
+	}
+}
+
+func TestHealthFailureKindsAndRedirect(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+	}{
+		{"service unavailable", http.StatusServiceUnavailable},
+		{"not found", http.StatusNotFound},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.code)
+			}))
+			t.Cleanup(server.Close)
+			pool, err := NewPool([]string{server.URL}, time.Second)
+			if err != nil {
+				t.Fatalf("NewPool returned error: %v", err)
+			}
+			pool.CheckOnce()
+			if got := pool.registry.List()[0].LastFailureKind; got != "bad_status" {
+				t.Fatalf("LastFailureKind = %q; want bad_status", got)
+			}
+		})
+	}
+
+	t.Run("connection refused", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		target := server.URL
+		server.Close()
+		pool, err := NewPool([]string{target}, time.Second)
+		if err != nil {
+			t.Fatalf("NewPool returned error: %v", err)
+		}
+		pool.CheckOnce()
+		if got := pool.registry.List()[0].LastFailureKind; got != "connection_refused" {
+			t.Fatalf("LastFailureKind = %q; want connection_refused", got)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		release := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+			select {
+			case <-release:
+			case <-request.Context().Done():
+			}
+		}))
+		t.Cleanup(server.Close)
+		t.Cleanup(func() { close(release) })
+		pool, err := NewPool([]string{server.URL}, time.Second)
+		if err != nil {
+			t.Fatalf("NewPool returned error: %v", err)
+		}
+		pool.ConfigureHealthChecks(40*time.Millisecond, 3, 2, "/")
+		pool.CheckOnce()
+		if got := pool.registry.List()[0].LastFailureKind; got != "timeout" {
+			t.Fatalf("LastFailureKind = %q; want timeout", got)
+		}
+	})
+
+	t.Run("redirect is not followed", func(t *testing.T) {
+		var targetHits atomic.Int32
+		target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			targetHits.Add(1)
+		}))
+		t.Cleanup(target.Close)
+		redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Redirect(w, httptest.NewRequest(http.MethodGet, "/", nil), target.URL, http.StatusFound)
+		}))
+		t.Cleanup(redirect.Close)
+		pool, err := NewPool([]string{redirect.URL}, time.Second)
+		if err != nil {
+			t.Fatalf("NewPool returned error: %v", err)
+		}
+		pool.CheckOnce()
+		status := pool.registry.List()[0]
+		if !status.Alive || status.LastFailureKind != "" || targetHits.Load() != 0 {
+			t.Fatalf("redirect status = %#v; target hits = %d", status, targetHits.Load())
+		}
+	})
+}
+
+func TestHealthTimeoutBound(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		select {
+		case <-release:
+		case <-request.Context().Done():
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	pool, err := NewPool([]string{server.URL}, time.Second)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(200*time.Millisecond, 3, 2, "/")
+	started := time.Now()
+	pool.CheckOnce()
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("CheckOnce took %v; want less than 2s", elapsed)
+	}
+	if got := pool.registry.List()[0].LastFailureKind; got != "timeout" {
+		t.Fatalf("LastFailureKind = %q; want timeout", got)
+	}
+}
+
+func TestHealthChecksRunInParallel(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	servers := make([]*httptest.Server, 3)
+	for index := range servers {
+		index := index
+		servers[index] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			if index < 2 {
+				entered <- struct{}{}
+				<-request.Context().Done()
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(servers[index].Close)
+	}
+	targets := []string{servers[0].URL, servers[1].URL, servers[2].URL}
+	pool, err := NewPool(targets, time.Second)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(300*time.Millisecond, 3, 2, "/")
+	done := make(chan struct{})
+	started := time.Now()
+	go func() {
+		pool.CheckOnce()
+		close(done)
+	}()
+	waitRegistrySignal(t, entered, "first blocking backend")
+	waitRegistrySignal(t, entered, "second blocking backend")
+	waitRegistrySignal(t, done, "parallel health-check round")
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("parallel health-check round took %v; want less than 500ms (one timeout budget)", elapsed)
+	}
+}
+
+func TestHealthCheckDoesNotOverlap(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBackend := func() { releaseOnce.Do(func() { close(release) }) }
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		hits.Add(1)
+		entered <- struct{}{}
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusOK)
+		case <-request.Context().Done():
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(releaseBackend)
+	pool, err := NewPool([]string{server.URL}, time.Second)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(3*time.Second, 3, 2, "/")
+	firstDone := make(chan struct{})
+	go func() {
+		pool.CheckOnce()
+		close(firstDone)
+	}()
+	waitRegistrySignal(t, entered, "first health request")
+	pool.CheckOnce()
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("overlapping check entered handler %d times; want 1", got)
+	}
+	releaseBackend()
+	waitRegistrySignal(t, firstDone, "first health round")
+	pool.CheckOnce()
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("next round entered handler %d times; want 2", got)
+	}
+}
+
+func TestHealthCheckLoopCancellationAbortsProbe(t *testing.T) {
+	entered := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(entered)
+		<-request.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	pool, err := NewPool([]string{server.URL}, time.Second)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(10*time.Second, 3, 2, "/")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pool.HealthCheckContext(ctx, time.Millisecond)
+		close(done)
+	}()
+	waitRegistrySignal(t, entered, "health probe to start")
+	started := time.Now()
+	cancel()
+	waitRegistrySignal(t, done, "health-check loop to stop")
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("health-check cancellation took %v; want less than 1s", elapsed)
+	}
+	if status := pool.registry.List()[0]; status.ConsecutiveFailures != 0 || !status.Alive {
+		t.Fatalf("canceled probe changed health state: %#v", status)
+	}
+}
+
+func TestHealthPathIsUsed(t *testing.T) {
+	paths := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		paths <- request.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	pool, err := NewPool([]string{server.URL}, time.Second)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(time.Second, 3, 2, "/healthz")
+	pool.CheckOnce()
+	if got := waitRegistryResult(t, paths, "health path"); got != "/healthz" {
+		t.Fatalf("health request path = %q; want /healthz", got)
+	}
+}
+
+func TestPassiveHardFailureRequiresActiveRecovery(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !healthy.Load() {
+			http.Error(w, "unhealthy", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(server.Close)
+	registry := NewRegistry(time.Second, time.Second)
+	backend, err := registry.Add(server.URL)
+	if err != nil {
+		t.Fatalf("Add backend: %v", err)
+	}
+	pool := &Pool{registry: registry, healthTimeout: time.Second, failThreshold: 3, riseThreshold: 2, healthPath: "/"}
+	originalDial := backend.transport.DialContext
+	backend.transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+	}
+	first := httptest.NewRecorder()
+	pool.Handler().ServeHTTP(first, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+	if first.Code != http.StatusBadGateway || backend.IsAlive() {
+		t.Fatalf("hard failure response=%d alive=%v; want one 502 and dead backend", first.Code, backend.IsAlive())
+	}
+	backend.transport.DialContext = originalDial
+	for range 4 {
+		recorder := httptest.NewRecorder()
+		pool.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("dead backend received production traffic: status %d; want 503", recorder.Code)
+		}
+	}
+	healthy.Store(true)
+	pool.CheckOnce()
+	if backend.IsAlive() {
+		t.Fatal("one active success recovered backend; want RiseThreshold successes")
+	}
+	pool.CheckOnce()
+	if !backend.IsAlive() {
+		t.Fatal("two active successes did not recover backend")
+	}
+}
+
+func TestPassiveSoftFailureUsesThreshold(t *testing.T) {
+	arrived := make(chan struct{}, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		arrived <- struct{}{}
+		<-request.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	pool, err := NewPool([]string{server.URL}, 40*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.ConfigureHealthChecks(time.Second, 3, 2, "/")
+	backend, _ := pool.registry.Get(server.URL)
+	for failure := 1; failure <= 3; failure++ {
+		recorder := httptest.NewRecorder()
+		pool.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+		if recorder.Code != http.StatusBadGateway {
+			t.Fatalf("soft failure %d returned %d; want 502", failure, recorder.Code)
+		}
+		waitRegistrySignal(t, arrived, "proxied request arrival")
+		status := backend.status()
+		if status.ConsecutiveFailures != uint64(failure) {
+			t.Fatalf("soft failure count = %d; want %d", status.ConsecutiveFailures, failure)
+		}
+		if backend.IsAlive() != (failure < 3) {
+			t.Fatalf("backend alive after soft failure %d = %v", failure, backend.IsAlive())
+		}
+	}
+}
+
+func TestFailureClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+		hard bool
+	}{
+		{"timeout", context.DeadlineExceeded, "timeout", false},
+		{"dial timeout", &net.OpError{Op: "dial", Err: context.DeadlineExceeded}, "timeout", false},
+		{"connection refused", fmt.Errorf("wrapped: %w", syscall.ECONNREFUSED), "connection_refused", true},
+		{"dns", &net.DNSError{Err: "not found", Name: "backend.invalid"}, "dns", false},
+		{"other", errors.New("reset"), "other", false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyFailure(test.err); got != test.want {
+				t.Fatalf("classifyFailure = %q; want %q", got, test.want)
+			}
+			if got := isHardProxyFailure(test.err); got != test.hard {
+				t.Fatalf("isHardProxyFailure = %v; want %v", got, test.hard)
+			}
+		})
 	}
 }

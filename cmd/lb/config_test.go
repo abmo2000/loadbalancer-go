@@ -35,24 +35,27 @@ func TestLoadConfig_Defaults(t *testing.T) {
 			t.Fatalf("Backends[%d] = %q; want %q", i, cfg.Backends[i], want.Backends[i])
 		}
 	}
-	if cfg.HealthInterval != want.HealthInterval || cfg.HealthTimeout != want.HealthTimeout || cfg.DialTimeout != want.DialTimeout || cfg.ResponseTimeout != want.ResponseTimeout || cfg.ReadHeaderTimeout != want.ReadHeaderTimeout || cfg.ReadTimeout != want.ReadTimeout || cfg.WriteTimeout != want.WriteTimeout || cfg.IdleTimeout != want.IdleTimeout || cfg.ShutdownTimeout != want.ShutdownTimeout {
+	if cfg.HealthInterval != want.HealthInterval || cfg.HealthTimeout != want.HealthTimeout || cfg.FailThreshold != want.FailThreshold || cfg.RiseThreshold != want.RiseThreshold || cfg.HealthPath != want.HealthPath || cfg.DialTimeout != want.DialTimeout || cfg.ResponseTimeout != want.ResponseTimeout || cfg.ReadHeaderTimeout != want.ReadHeaderTimeout || cfg.ReadTimeout != want.ReadTimeout || cfg.WriteTimeout != want.WriteTimeout || cfg.IdleTimeout != want.IdleTimeout || cfg.ShutdownTimeout != want.ShutdownTimeout {
 		t.Fatalf("unexpected default values: %#v; want %#v", cfg, want)
 	}
 }
 
 func TestLoadConfig_EnvOverridesDefaults(t *testing.T) {
 	env := map[string]string{
-		"LB_LISTEN_ADDR":         ":9090",
-		"LB_BACKENDS":            "http://10.0.0.5:8000, http://10.0.0.6:8000",
-		"LB_HEALTH_INTERVAL":     "250ms",
-		"LB_HEALTH_TIMEOUT":      "750ms",
-		"LB_DIAL_TIMEOUT":        "2s",
-		"LB_RESPONSE_TIMEOUT":    "15s",
-		"LB_READ_HEADER_TIMEOUT": "4s",
-		"LB_READ_TIMEOUT":        "12s",
-		"LB_WRITE_TIMEOUT":       "20s",
-		"LB_IDLE_TIMEOUT":        "30s",
-		"LB_SHUTDOWN_TIMEOUT":    "18s",
+		"LB_LISTEN_ADDR":           ":9090",
+		"LB_BACKENDS":              "http://10.0.0.5:8000, http://10.0.0.6:8000",
+		"LB_HEALTH_INTERVAL":       "250ms",
+		"LB_HEALTH_TIMEOUT":        "750ms",
+		"LB_HEALTH_FAIL_THRESHOLD": "4",
+		"LB_HEALTH_RISE_THRESHOLD": "5",
+		"LB_HEALTH_PATH":           "/healthz",
+		"LB_DIAL_TIMEOUT":          "2s",
+		"LB_RESPONSE_TIMEOUT":      "15s",
+		"LB_READ_HEADER_TIMEOUT":   "4s",
+		"LB_READ_TIMEOUT":          "12s",
+		"LB_WRITE_TIMEOUT":         "20s",
+		"LB_IDLE_TIMEOUT":          "30s",
+		"LB_SHUTDOWN_TIMEOUT":      "18s",
 	}
 	cfg, err := LoadConfig(envLookup(env), nil)
 	if err != nil {
@@ -64,30 +67,36 @@ func TestLoadConfig_EnvOverridesDefaults(t *testing.T) {
 	if got, want := cfg.Backends, []string{"http://10.0.0.5:8000", "http://10.0.0.6:8000"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("Backends = %#v; want %#v", got, want)
 	}
-	if cfg.HealthInterval != 250*time.Millisecond || cfg.HealthTimeout != 750*time.Millisecond || cfg.DialTimeout != 2*time.Second || cfg.ResponseTimeout != 15*time.Second || cfg.ReadHeaderTimeout != 4*time.Second || cfg.ReadTimeout != 12*time.Second || cfg.WriteTimeout != 20*time.Second || cfg.IdleTimeout != 30*time.Second || cfg.ShutdownTimeout != 18*time.Second {
+	if cfg.HealthInterval != 250*time.Millisecond || cfg.HealthTimeout != 750*time.Millisecond || cfg.FailThreshold != 4 || cfg.RiseThreshold != 5 || cfg.HealthPath != "/healthz" || cfg.DialTimeout != 2*time.Second || cfg.ResponseTimeout != 15*time.Second || cfg.ReadHeaderTimeout != 4*time.Second || cfg.ReadTimeout != 12*time.Second || cfg.WriteTimeout != 20*time.Second || cfg.IdleTimeout != 30*time.Second || cfg.ShutdownTimeout != 18*time.Second {
 		t.Fatalf("unexpected env-derived config: %#v", cfg)
 	}
 }
 
 func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	env := map[string]string{
-		"LB_LISTEN_ADDR":         ":9090",
-		"LB_BACKENDS":            "http://10.0.0.5:8000",
-		"LB_HEALTH_INTERVAL":     "250ms",
-		"LB_HEALTH_TIMEOUT":      "750ms",
-		"LB_DIAL_TIMEOUT":        "2s",
-		"LB_RESPONSE_TIMEOUT":    "15s",
-		"LB_READ_HEADER_TIMEOUT": "4s",
-		"LB_READ_TIMEOUT":        "12s",
-		"LB_WRITE_TIMEOUT":       "20s",
-		"LB_IDLE_TIMEOUT":        "30s",
-		"LB_SHUTDOWN_TIMEOUT":    "18s",
+		"LB_LISTEN_ADDR":           ":9090",
+		"LB_BACKENDS":              "http://10.0.0.5:8000",
+		"LB_HEALTH_INTERVAL":       "250ms",
+		"LB_HEALTH_TIMEOUT":        "750ms",
+		"LB_HEALTH_FAIL_THRESHOLD": "4",
+		"LB_HEALTH_RISE_THRESHOLD": "5",
+		"LB_HEALTH_PATH":           "/healthz",
+		"LB_DIAL_TIMEOUT":          "2s",
+		"LB_RESPONSE_TIMEOUT":      "15s",
+		"LB_READ_HEADER_TIMEOUT":   "4s",
+		"LB_READ_TIMEOUT":          "12s",
+		"LB_WRITE_TIMEOUT":         "20s",
+		"LB_IDLE_TIMEOUT":          "30s",
+		"LB_SHUTDOWN_TIMEOUT":      "18s",
 	}
 	cfg, err := LoadConfig(envLookup(env), []string{
 		"-listen", ":9191",
 		"-backends", "http://10.0.0.7:8000,http://10.0.0.8:8000",
 		"-health-interval", "300ms",
 		"-health-timeout", "900ms",
+		"-health-fail-threshold", "6",
+		"-health-rise-threshold", "7",
+		"-health-path", "/ready",
 		"-dial-timeout", "3s",
 		"-response-timeout", "16s",
 		"-read-header-timeout", "5s",
@@ -105,7 +114,7 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	if got, want := cfg.Backends, []string{"http://10.0.0.7:8000", "http://10.0.0.8:8000"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("Backends = %#v; want %#v", got, want)
 	}
-	if cfg.HealthInterval != 300*time.Millisecond || cfg.HealthTimeout != 900*time.Millisecond || cfg.DialTimeout != 3*time.Second || cfg.ResponseTimeout != 16*time.Second || cfg.ReadHeaderTimeout != 5*time.Second || cfg.ReadTimeout != 13*time.Second || cfg.WriteTimeout != 21*time.Second || cfg.IdleTimeout != 31*time.Second || cfg.ShutdownTimeout != 19*time.Second {
+	if cfg.HealthInterval != 300*time.Millisecond || cfg.HealthTimeout != 900*time.Millisecond || cfg.FailThreshold != 6 || cfg.RiseThreshold != 7 || cfg.HealthPath != "/ready" || cfg.DialTimeout != 3*time.Second || cfg.ResponseTimeout != 16*time.Second || cfg.ReadHeaderTimeout != 5*time.Second || cfg.ReadTimeout != 13*time.Second || cfg.WriteTimeout != 21*time.Second || cfg.IdleTimeout != 31*time.Second || cfg.ShutdownTimeout != 19*time.Second {
 		t.Fatalf("unexpected flag-derived config: %#v", cfg)
 	}
 }
@@ -395,6 +404,53 @@ func TestWarnings_ShutdownShorterThanResponse(t *testing.T) {
 	warnings := cfg.Warnings()
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "LB_SHUTDOWN_TIMEOUT") || !strings.Contains(warnings[0], "5s") || !strings.Contains(warnings[0], "LB_RESPONSE_TIMEOUT") || !strings.Contains(warnings[0], "10s") {
 		t.Fatalf("Warnings = %#v; want shutdown/response warning", warnings)
+	}
+}
+
+func TestHealthCheckConfigValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		setting string
+		value   string
+	}{
+		{"fail threshold zero", map[string]string{"LB_HEALTH_FAIL_THRESHOLD": "0"}, "LB_HEALTH_FAIL_THRESHOLD", `"0"`},
+		{"fail threshold too high", map[string]string{"LB_HEALTH_FAIL_THRESHOLD": "11"}, "LB_HEALTH_FAIL_THRESHOLD", `"11"`},
+		{"fail threshold not integer", map[string]string{"LB_HEALTH_FAIL_THRESHOLD": "abc"}, "LB_HEALTH_FAIL_THRESHOLD", `"abc"`},
+		{"rise threshold zero", map[string]string{"LB_HEALTH_RISE_THRESHOLD": "0"}, "LB_HEALTH_RISE_THRESHOLD", `"0"`},
+		{"rise threshold too high", map[string]string{"LB_HEALTH_RISE_THRESHOLD": "11"}, "LB_HEALTH_RISE_THRESHOLD", `"11"`},
+		{"rise threshold not integer", map[string]string{"LB_HEALTH_RISE_THRESHOLD": "abc"}, "LB_HEALTH_RISE_THRESHOLD", `"abc"`},
+		{"path missing slash", map[string]string{"LB_HEALTH_PATH": "healthz"}, "LB_HEALTH_PATH", `"healthz"`},
+		{"path query", map[string]string{"LB_HEALTH_PATH": "/health?x=1"}, "LB_HEALTH_PATH", `"/health?x=1"`},
+		{"path space", map[string]string{"LB_HEALTH_PATH": "/health check"}, "LB_HEALTH_PATH", `"/health check"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := LoadConfig(envLookup(test.env), nil)
+			if err != nil {
+				assertConfigError(t, err, test.setting, strings.Trim(test.value, `"`))
+				return
+			}
+			assertConfigError(t, cfg.Validate(), test.setting, strings.Trim(test.value, `"`))
+		})
+	}
+}
+
+func TestWarnings_HealthDetectionTime(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HealthInterval = 30 * time.Second
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+	warnings := cfg.Warnings()
+	found := false
+	for _, warning := range warnings {
+		if strings.Contains(warning, "LB_HEALTH_FAIL_THRESHOLD") && strings.Contains(warning, "1m30s") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Warnings = %#v; want 1m30s detection warning", warnings)
 	}
 }
 

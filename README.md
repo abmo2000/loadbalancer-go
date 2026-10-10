@@ -54,6 +54,9 @@ The effective values are logged at startup and any invalid configuration exits w
 | Backends | `LB_BACKENDS` | `-backends` | `http://localhost:9001,http://localhost:9002,http://localhost:9003` | Comma-separated backend URLs |
 | Health interval | `LB_HEALTH_INTERVAL` | `-health-interval` | `5s` | How often the pool probes backends |
 | Health timeout | `LB_HEALTH_TIMEOUT` | `-health-timeout` | `2s` | Timeout for health-check HTTP requests |
+| Health fail threshold | `LB_HEALTH_FAIL_THRESHOLD` | `-health-fail-threshold` | `3` | Consecutive failures before marking a backend dead |
+| Health rise threshold | `LB_HEALTH_RISE_THRESHOLD` | `-health-rise-threshold` | `2` | Consecutive active successes before recovery |
+| Health path | `LB_HEALTH_PATH` | `-health-path` | `/` | Path used for active health checks |
 | Dial timeout | `LB_DIAL_TIMEOUT` | `-dial-timeout` | `3s` | Timeout for backend connection attempts |
 | Response timeout | `LB_RESPONSE_TIMEOUT` | `-response-timeout` | `10s` | Response-header timeout for proxied requests |
 | Read-header timeout | `LB_READ_HEADER_TIMEOUT` | `-read-header-timeout` | `5s` | Server read-header timeout |
@@ -258,7 +261,7 @@ Removing a backend prevents future snapshots from selecting or checking it and c
 - `LastError`: most recent proxy or health-check error, cleared by a successful health check.
 - `AddedAt`: time the backend was registered.
 
-Registry changes are in memory only and are lost when the process restarts. There is no failure threshold yet: a proxy failure marks the backend unhealthy, and the next successful health check restores it.
+Registry changes are in memory only and are lost when the process restarts. Active failures use the configured threshold, and recovery requires consecutive successful active checks. Passive hard dial failures still mark a backend dead immediately.
 
 The registry tests cover these guarantees:
 
@@ -272,10 +275,74 @@ The registry tests cover these guarantees:
 - `TestRegistryRaceConcurrentChanges`: exercises concurrent requests, add/remove, status listing, and health checks.
 - `TestPoolEmptyRegistry`: confirms an empty registry selects no backend and responds with 503.
 
+## Health checks (Phase 1)
+
+Health checks use explicit failure and recovery thresholds. Ordinary probe failures do not immediately remove a backend, and successful client traffic never probes a backend that is already dead.
+
+```text
+          failure below threshold
+        +-------------------------------+
+        |                               v
+      +--------+   threshold failures   +------+
+      | ALIVE  | ----------------------> | DEAD |
+      +--------+                         +------+
+        ^                               |
+        +-------------------------------+
+          RiseThreshold consecutive active
+          successful checks
+
+DEAD + active failure -> remain DEAD; reset success streak
+ALIVE + active success -> remain ALIVE; reset failure streak
+Passive hard dial failure -> ALIVE to DEAD immediately
+```
+
+| Setting | Flag | Environment | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| Check interval | `-health-interval` | `LB_HEALTH_INTERVAL` | `5s` | Delay between active-check rounds |
+| Check timeout | `-health-timeout` | `LB_HEALTH_TIMEOUT` | `2s` | Total time allowed for one probe, including body drain |
+| Failure threshold | `-health-fail-threshold` | `LB_HEALTH_FAIL_THRESHOLD` | `3` | Consecutive active failures before marking an alive backend dead |
+| Recovery threshold | `-health-rise-threshold` | `LB_HEALTH_RISE_THRESHOLD` | `2` | Consecutive active successes required to recover a dead backend |
+| Probe path | `-health-path` | `LB_HEALTH_PATH` | `/` | Path appended to each backend base URL for active checks |
+
+Probe failures are classified as:
+
+| Kind | Meaning |
+| --- | --- |
+| `timeout` | The check or network operation exceeded its deadline |
+| `connection_refused` | The target actively refused a connection |
+| `dns` | Name resolution failed |
+| `bad_status` | The probe returned outside the accepted `200..399` range |
+| `other` | Another request, transport, or response-body error |
+
+An alive backend increments its failure streak on each active failure and is marked dead at `LB_HEALTH_FAIL_THRESHOLD`. A successful active check resets that streak. A dead backend remains unavailable until it reaches `LB_HEALTH_RISE_THRESHOLD` consecutive successful active checks; any failed active check resets the recovery streak. This prevents production requests from accidentally reviving a backend that should still be excluded. Connection-refused and other non-timeout dial failures detected by the proxy remain hard failures and mark the backend dead immediately; proxy timeouts and mid-response failures use the configured failure threshold.
+
+Detection takes roughly `HealthInterval * FailThreshold`; recovery takes roughly `HealthInterval * RiseThreshold`, plus up to one interval depending on where a failure or recovery begins relative to the next tick. With defaults, detection is about `5s * 3 = 15s`, and recovery is about `5s * 2 = 10s`.
+
+Each round checks backends in parallel so one slow target does not add its timeout to every later target. An atomic per-backend guard skips an overlapping probe instead of allowing rounds to pile up; a backend emits at most one skip log while its current check is running. Each backend has a separate health transport with one idle connection per host, so probes do not share proxy traffic connections. Probe requests derive their timeout context from the health-loop context, drain at most 4 KB, and do not follow redirects.
+
+Known limits: checks have no jitter, thresholds and paths cannot be overridden per backend, and all health state is in memory and resets on restart.
+
+Health-check tests cover these behaviors:
+
+- `TestHealthFailureThresholdAndReset`: verifies two failures remain alive, a success resets the streak, and the next third consecutive failure marks the backend dead.
+- `TestHealthRecoveryThresholdAndFlapping`: verifies recovery requires two active successes and a failure resets progress.
+- `TestHealthFailureKindsAndRedirect`: checks timeout, refused connection, 404/503 classification, and that redirects are not followed.
+- `TestHealthTimeoutBound`: confirms a blocked probe is canceled within the configured timeout and records `timeout`.
+- `TestHealthChecksRunInParallel`: verifies a round with multiple blocked probes finishes within one timeout budget.
+- `TestHealthCheckDoesNotOverlap`: verifies a second round skips a backend already being checked and a later round runs normally.
+- `TestHealthCheckLoopCancellationAbortsProbe`: verifies loop cancellation aborts a blocked probe and exits promptly.
+- `TestHealthPathIsUsed`: confirms active checks request the configured path.
+- `TestPassiveHardFailureRequiresActiveRecovery`: verifies immediate passive hard-failure removal and recovery only through active checks.
+- `TestPassiveSoftFailureUsesThreshold`: verifies proxy timeouts count toward the failure threshold rather than killing the backend immediately.
+- `TestFailureClassification`: checks error-based classification for timeout, refused connection, DNS, and other errors.
+- `TestHealthCheckConfigValidation`: covers threshold bounds and health-path requirements.
+- `TestWarnings_HealthDetectionTime`: checks the warning for a long failure-detection window.
+- `TestRegistryRaceConcurrentChanges`: exercises traffic, checks, registry updates, and status snapshots concurrently.
+
 ## Design notes
 
-- A single timeout marks a backend dead until the next health check. This is a deliberate simplification for the demo implementation.
-- A production system would usually use a failure threshold or a short rolling error count before marking a backend unhealthy for a longer period.
+- Passive hard dial failures mark a backend dead immediately; all other failures follow the configured consecutive-failure threshold.
+- Thresholds are consecutive counts, not a rolling time window, and there is no jitter or per-backend override yet.
 
 ## Project layout
 

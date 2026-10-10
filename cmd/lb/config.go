@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const missingEnvValue = "\x00"
@@ -26,6 +27,9 @@ type Config struct {
 	Backends          []string
 	HealthInterval    time.Duration
 	HealthTimeout     time.Duration
+	FailThreshold     int
+	RiseThreshold     int
+	HealthPath        string
 	DialTimeout       time.Duration
 	ResponseTimeout   time.Duration
 	ReadHeaderTimeout time.Duration
@@ -42,6 +46,9 @@ func DefaultConfig() Config {
 		Backends:          append([]string(nil), defaultBackends...),
 		HealthInterval:    5 * time.Second,
 		HealthTimeout:     2 * time.Second,
+		FailThreshold:     3,
+		RiseThreshold:     2,
+		HealthPath:        "/",
 		DialTimeout:       3 * time.Second,
 		ResponseTimeout:   10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -118,6 +125,26 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 			cfg.CheckOnly = checkOnly
 		}
 	}
+	thresholdSettings := []struct {
+		name   string
+		target *int
+	}{
+		{"LB_HEALTH_FAIL_THRESHOLD", &cfg.FailThreshold},
+		{"LB_HEALTH_RISE_THRESHOLD", &cfg.RiseThreshold},
+	}
+	for _, setting := range thresholdSettings {
+		if value, ok := lookupEnvValue(getenv, setting.name); ok {
+			threshold, err := strconv.Atoi(value)
+			if err != nil {
+				parseProblems = append(parseProblems, fmt.Errorf("%s: %q must be an integer from 1 to 10", setting.name, value))
+				continue
+			}
+			*setting.target = threshold
+		}
+	}
+	if value, ok := lookupEnvValue(getenv, "LB_HEALTH_PATH"); ok {
+		cfg.HealthPath = value
+	}
 
 	fs := flag.NewFlagSet("loadbalancer-go", flag.ContinueOnError)
 	var flagOutput bytes.Buffer
@@ -128,6 +155,9 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	fs.StringVar(&backendsValue, "backends", strings.Join(cfg.Backends, ","), "comma-separated backend URLs")
 	fs.DurationVar(&cfg.HealthInterval, "health-interval", cfg.HealthInterval, "health check interval")
 	fs.DurationVar(&cfg.HealthTimeout, "health-timeout", cfg.HealthTimeout, "health check HTTP client timeout")
+	fs.IntVar(&cfg.FailThreshold, "health-fail-threshold", cfg.FailThreshold, "consecutive failures before marking a backend dead")
+	fs.IntVar(&cfg.RiseThreshold, "health-rise-threshold", cfg.RiseThreshold, "consecutive active successes before recovering a backend")
+	fs.StringVar(&cfg.HealthPath, "health-path", cfg.HealthPath, "path used for active health checks")
 	fs.DurationVar(&cfg.DialTimeout, "dial-timeout", cfg.DialTimeout, "backend dial timeout")
 	fs.DurationVar(&cfg.ResponseTimeout, "response-timeout", cfg.ResponseTimeout, "backend response-header timeout")
 	fs.DurationVar(&cfg.ReadHeaderTimeout, "read-header-timeout", cfg.ReadHeaderTimeout, "server read-header timeout")
@@ -162,6 +192,15 @@ func (c *Config) Validate() error {
 
 	if len(c.Backends) == 0 {
 		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must contain at least one http(s) backend URL", strings.Join(c.Backends, ",")))
+	}
+	if c.FailThreshold < 1 || c.FailThreshold > 10 {
+		problems = append(problems, fmt.Errorf("LB_HEALTH_FAIL_THRESHOLD: %q must be an integer from 1 to 10", strconv.Itoa(c.FailThreshold)))
+	}
+	if c.RiseThreshold < 1 || c.RiseThreshold > 10 {
+		problems = append(problems, fmt.Errorf("LB_HEALTH_RISE_THRESHOLD: %q must be an integer from 1 to 10", strconv.Itoa(c.RiseThreshold)))
+	}
+	if !strings.HasPrefix(c.HealthPath, "/") || strings.ContainsAny(c.HealthPath, " \t\r\n?#") || utf8.RuneCountInString(c.HealthPath) > 200 {
+		problems = append(problems, fmt.Errorf("LB_HEALTH_PATH: %q must start with /, contain no spaces, ? or #, and be at most 200 characters", c.HealthPath))
 	}
 
 	listenHost, listenPort, listenValid, listenProblems := validateListenAddr(c.ListenAddr)
@@ -352,10 +391,17 @@ func localHost(host string) bool {
 }
 
 func (c Config) Warnings() []string {
+	var warnings []string
 	if c.ShutdownTimeout > 0 && c.ResponseTimeout > 0 && c.ShutdownTimeout < c.ResponseTimeout {
-		return []string{fmt.Sprintf("LB_SHUTDOWN_TIMEOUT %q is shorter than LB_RESPONSE_TIMEOUT %q; in-flight requests may be cut off during shutdown", c.ShutdownTimeout, c.ResponseTimeout)}
+		warnings = append(warnings, fmt.Sprintf("LB_SHUTDOWN_TIMEOUT %q is shorter than LB_RESPONSE_TIMEOUT %q; in-flight requests may be cut off during shutdown", c.ShutdownTimeout, c.ResponseTimeout))
 	}
-	return nil
+	if c.HealthInterval > 0 && c.FailThreshold > 0 {
+		detectionTime := c.HealthInterval * time.Duration(c.FailThreshold)
+		if detectionTime > c.ResponseTimeout*3 || detectionTime > 60*time.Second {
+			warnings = append(warnings, fmt.Sprintf("LB_HEALTH_INTERVAL %q times LB_HEALTH_FAIL_THRESHOLD %d means dead backends may take %s to detect", c.HealthInterval, c.FailThreshold, detectionTime))
+		}
+	}
+	return warnings
 }
 
 func Preflight(c Config) error {
@@ -368,11 +414,14 @@ func Preflight(c Config) error {
 
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"listen=%s backends=%v healthInterval=%s healthTimeout=%s dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
+		"listen=%s backends=%v healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
 		c.ListenAddr,
 		c.Backends,
 		c.HealthInterval,
 		c.HealthTimeout,
+		c.FailThreshold,
+		c.RiseThreshold,
+		c.HealthPath,
 		c.DialTimeout,
 		c.ResponseTimeout,
 		c.ReadHeaderTimeout,

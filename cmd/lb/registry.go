@@ -15,15 +15,18 @@ var (
 )
 
 type BackendStatus struct {
-	URL                 string    `json:"url"`
-	Alive               bool      `json:"alive"`
-	ConsecutiveFailures uint64    `json:"consecutiveFailures"`
-	TotalRequests       uint64    `json:"totalRequests"`
-	TotalFailures       uint64    `json:"totalFailures"`
-	ActiveConns         int64     `json:"activeConns"`
-	LastCheck           time.Time `json:"lastCheck"`
-	LastError           string    `json:"lastError"`
-	AddedAt             time.Time `json:"addedAt"`
+	URL                  string    `json:"url"`
+	Alive                bool      `json:"alive"`
+	ConsecutiveFailures  uint64    `json:"consecutiveFailures"`
+	ConsecutiveSuccesses uint64    `json:"consecutiveSuccesses"`
+	TotalRequests        uint64    `json:"totalRequests"`
+	TotalFailures        uint64    `json:"totalFailures"`
+	ActiveConns          int64     `json:"activeConns"`
+	LastCheck            time.Time `json:"lastCheck"`
+	LastError            string    `json:"lastError"`
+	LastFailureKind      string    `json:"lastFailureKind"`
+	LastStateChange      time.Time `json:"lastStateChange"`
+	AddedAt              time.Time `json:"addedAt"`
 }
 
 type Registry struct {
@@ -32,6 +35,8 @@ type Registry struct {
 	backends        atomic.Pointer[[]*Backend]
 	responseTimeout time.Duration
 	dialTimeout     time.Duration
+	failThreshold   int
+	riseThreshold   int
 }
 
 func NewRegistry(responseTimeout, dialTimeout time.Duration) *Registry {
@@ -39,6 +44,8 @@ func NewRegistry(responseTimeout, dialTimeout time.Duration) *Registry {
 		byURL:           make(map[string]*Backend),
 		responseTimeout: responseTimeout,
 		dialTimeout:     dialTimeout,
+		failThreshold:   3,
+		riseThreshold:   2,
 	}
 	empty := make([]*Backend, 0)
 	registry.backends.Store(&empty)
@@ -57,6 +64,7 @@ func (r *Registry) Add(rawURL string) (*Backend, error) {
 		return nil, fmt.Errorf("%w: %s", ErrDuplicateBackend, normalized)
 	}
 	backend := NewBackend(parsed, r.dialTimeout, r.responseTimeout)
+	backend.configureHealth(r.failThreshold, r.riseThreshold)
 	backends := append(r.snapshot(), backend)
 	r.byURL[normalized] = backend
 	r.store(backends)
@@ -86,6 +94,7 @@ func (r *Registry) Remove(rawURL string) error {
 	r.mu.Unlock()
 
 	backend.transport.CloseIdleConnections()
+	backend.healthTransport.CloseIdleConnections()
 	return nil
 }
 
@@ -122,6 +131,16 @@ func (r *Registry) Healthy() []*Backend {
 
 func (r *Registry) Len() int {
 	return len(r.snapshot())
+}
+
+func (r *Registry) configureHealth(failThreshold, riseThreshold int) {
+	r.mu.Lock()
+	r.failThreshold = failThreshold
+	r.riseThreshold = riseThreshold
+	for _, backend := range r.snapshot() {
+		backend.configureHealth(failThreshold, riseThreshold)
+	}
+	r.mu.Unlock()
 }
 
 func (r *Registry) SetAlive(rawURL string, alive bool) error {

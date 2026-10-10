@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -20,18 +21,27 @@ import (
 )
 
 type Backend struct {
-	URL                 *url.URL
-	Proxy               *httputil.ReverseProxy
-	mu                  sync.RWMutex
-	alive               bool
-	activeConns         atomic.Int64
-	totalRequests       atomic.Uint64
-	totalFailures       atomic.Uint64
-	consecutiveFailures atomic.Uint64
-	lastCheck           time.Time
-	lastError           string
-	addedAt             time.Time
-	transport           *http.Transport
+	URL                  *url.URL
+	Proxy                *httputil.ReverseProxy
+	mu                   sync.RWMutex
+	alive                bool
+	activeConns          atomic.Int64
+	totalRequests        atomic.Uint64
+	totalFailures        atomic.Uint64
+	consecutiveFailures  atomic.Uint64
+	consecutiveSuccesses atomic.Uint64
+	lastCheck            time.Time
+	lastError            string
+	lastFailureKind      string
+	lastStateChange      time.Time
+	addedAt              time.Time
+	transport            *http.Transport
+	healthTransport      *http.Transport
+	healthClient         *http.Client
+	failThreshold        int
+	riseThreshold        int
+	checking             atomic.Bool
+	skipLogged           atomic.Bool
 }
 
 func NewBackend(u *url.URL, args ...time.Duration) *Backend {
@@ -45,7 +55,15 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 		responseTimeout = args[1]
 	}
 
-	b := &Backend{URL: u, alive: true, addedAt: time.Now()}
+	now := time.Now()
+	b := &Backend{
+		URL:             u,
+		alive:           true,
+		addedAt:         now,
+		lastStateChange: now,
+		failThreshold:   3,
+		riseThreshold:   2,
+	}
 	b.Proxy = httputil.NewSingleHostReverseProxy(u)
 	b.transport = &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
@@ -54,12 +72,25 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 		MaxIdleConnsPerHost:   100,
 	}
 	b.Proxy.Transport = b.transport
+	b.healthTransport = &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		IdleConnTimeout:     10 * time.Second,
+		DisableKeepAlives:   false,
+		MaxIdleConnsPerHost: 1,
+	}
+	b.healthClient = &http.Client{
+		Transport: b.healthTransport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	b.Proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		log.Printf("proxy error for %s: %v", b.URL, err)
-		b.recordProxyFailure(err)
+		if failures, kind, changed := b.recordProxyFailure(err); changed {
+			log.Printf("backend %s marked dead after %d failures: %s", b.URL, failures, kind)
+		}
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 	}
 	return b
@@ -67,6 +98,9 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 
 func (b *Backend) SetAlive(a bool) {
 	b.mu.Lock()
+	if b.alive != a {
+		b.lastStateChange = time.Now()
+	}
 	b.alive = a
 	b.mu.Unlock()
 }
@@ -77,40 +111,113 @@ func (b *Backend) IsAlive() bool {
 	return b.alive
 }
 
-func (b *Backend) recordProxyFailure(err error) {
+func (b *Backend) recordProxyFailure(err error) (uint64, string, bool) {
+	kind := classifyFailure(err)
+	hardFailure := isHardProxyFailure(err)
 	b.totalFailures.Add(1)
-	b.consecutiveFailures.Add(1)
 	b.mu.Lock()
-	b.alive = false
+	failures := b.consecutiveFailures.Add(1)
+	b.consecutiveSuccesses.Store(0)
 	b.lastError = err.Error()
+	b.lastFailureKind = kind
+	changed := b.alive && (hardFailure || failures >= uint64(b.failThreshold))
+	if changed {
+		b.alive = false
+		b.lastStateChange = time.Now()
+	}
+	b.mu.Unlock()
+	return failures, kind, changed
+}
+
+func (b *Backend) recordActiveCheck(success bool, kind string, checkErr error) (string, uint64) {
+	b.mu.Lock()
+	now := time.Now()
+	b.lastCheck = now
+	if success {
+		b.lastError = ""
+		b.lastFailureKind = ""
+		b.consecutiveFailures.Store(0)
+		if b.alive {
+			b.consecutiveSuccesses.Store(0)
+			b.mu.Unlock()
+			return "", 0
+		}
+		successes := b.consecutiveSuccesses.Add(1)
+		if successes >= uint64(b.riseThreshold) {
+			b.alive = true
+			b.lastStateChange = now
+			b.mu.Unlock()
+			return "recovered", successes
+		}
+		b.mu.Unlock()
+		return "", successes
+	}
+	b.lastError = checkErr.Error()
+	b.lastFailureKind = kind
+	b.consecutiveSuccesses.Store(0)
+	if !b.alive {
+		b.mu.Unlock()
+		return "", 0
+	}
+	failures := b.consecutiveFailures.Add(1)
+	if failures >= uint64(b.failThreshold) {
+		b.alive = false
+		b.lastStateChange = now
+		b.mu.Unlock()
+		return kind, failures
+	}
+	b.mu.Unlock()
+	return "", failures
+}
+
+func (b *Backend) configureHealth(failThreshold, riseThreshold int) {
+	b.mu.Lock()
+	b.failThreshold = failThreshold
+	b.riseThreshold = riseThreshold
 	b.mu.Unlock()
 }
 
-func (b *Backend) recordHealthCheck(alive bool, checkErr error) bool {
-	b.mu.Lock()
-	changed := b.alive != alive
-	b.alive = alive
-	b.lastCheck = time.Now()
-	if checkErr != nil {
-		b.lastError = checkErr.Error()
-		b.consecutiveFailures.Add(1)
-	} else {
-		b.lastError = ""
-		b.consecutiveFailures.Store(0)
+func classifyFailure(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
 	}
-	b.mu.Unlock()
-	return changed
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
+	}
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		return "dns"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "connection_refused"
+	}
+	return "other"
+}
+
+func isHardProxyFailure(err error) bool {
+	if classifyFailure(err) == "timeout" {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var operationError *net.OpError
+	return errors.As(err, &operationError) && operationError.Op == "dial"
 }
 
 func (b *Backend) status() BackendStatus {
 	b.mu.RLock()
 	status := BackendStatus{
-		URL:                 b.URL.String(),
-		Alive:               b.alive,
-		ConsecutiveFailures: b.consecutiveFailures.Load(),
-		LastCheck:           b.lastCheck,
-		LastError:           b.lastError,
-		AddedAt:             b.addedAt,
+		URL:                  b.URL.String(),
+		Alive:                b.alive,
+		ConsecutiveFailures:  b.consecutiveFailures.Load(),
+		ConsecutiveSuccesses: b.consecutiveSuccesses.Load(),
+		LastCheck:            b.lastCheck,
+		LastError:            b.lastError,
+		LastFailureKind:      b.lastFailureKind,
+		LastStateChange:      b.lastStateChange,
+		AddedAt:              b.addedAt,
 	}
 	b.mu.RUnlock()
 	status.TotalRequests = b.totalRequests.Load()
@@ -123,6 +230,9 @@ type Pool struct {
 	registry      *Registry
 	counter       uint64
 	healthTimeout time.Duration
+	failThreshold int
+	riseThreshold int
+	healthPath    string
 }
 
 func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
@@ -141,7 +251,7 @@ func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
 			return nil, err
 		}
 	}
-	return &Pool{registry: registry, healthTimeout: 2 * time.Second}, nil
+	return &Pool{registry: registry, healthTimeout: 2 * time.Second, failThreshold: 3, riseThreshold: 2, healthPath: "/"}, nil
 }
 
 func (p *Pool) Next() *Backend {
@@ -161,25 +271,88 @@ func (p *Pool) Next() *Backend {
 }
 
 func (p *Pool) CheckOnce() {
+	p.CheckOnceContext(context.Background())
+}
+
+func (p *Pool) CheckOnceContext(ctx context.Context) {
+	var checks sync.WaitGroup
+	for _, backend := range p.registry.snapshot() {
+		if !backend.checking.CompareAndSwap(false, true) {
+			if backend.skipLogged.CompareAndSwap(false, true) {
+				log.Printf("health check for %s still running, skipping tick", backend.URL)
+			}
+			continue
+		}
+		backend.skipLogged.Store(false)
+		checks.Add(1)
+		go func(backend *Backend) {
+			defer checks.Done()
+			defer backend.checking.Store(false)
+			defer backend.skipLogged.Store(false)
+			p.checkBackend(ctx, backend)
+		}(backend)
+	}
+	checks.Wait()
+}
+
+func (p *Pool) checkBackend(parent context.Context, backend *Backend) {
 	timeout := p.healthTimeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	client := http.Client{Timeout: timeout}
-	for _, b := range p.registry.snapshot() {
-		resp, err := client.Get(b.URL.String())
-		alive := err == nil && resp.StatusCode < 500
-		checkErr := err
-		if err == nil {
-			if resp.StatusCode >= 500 {
-				checkErr = fmt.Errorf("health check returned HTTP status %d", resp.StatusCode)
-			}
-			_ = resp.Body.Close()
-		}
-		if b.recordHealthCheck(alive, checkErr) {
-			log.Printf("backend %s alive=%v", b.URL, alive)
-		}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	probeURL := *backend.URL
+	path := p.healthPath
+	if path == "" {
+		path = "/"
 	}
+	probeURL.Path = path
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL.String(), nil)
+	if err != nil {
+		p.recordCheckResult(backend, false, classifyFailure(err), err)
+		return
+	}
+	response, err := backend.healthClient.Do(request)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		p.recordCheckResult(backend, false, classifyFailure(err), err)
+		return
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, 4096)); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		p.recordCheckResult(backend, false, classifyFailure(err), err)
+		return
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusBadRequest {
+		checkErr := fmt.Errorf("health check returned HTTP status %d", response.StatusCode)
+		p.recordCheckResult(backend, false, "bad_status", checkErr)
+		return
+	}
+	p.recordCheckResult(backend, true, "", nil)
+}
+
+func (p *Pool) recordCheckResult(backend *Backend, success bool, kind string, checkErr error) {
+	transition, count := backend.recordActiveCheck(success, kind, checkErr)
+	switch transition {
+	case "recovered":
+		log.Printf("backend %s recovered after %d successes", backend.URL, count)
+	case "timeout", "connection_refused", "dns", "bad_status", "other":
+		log.Printf("backend %s marked dead after %d failures: %s", backend.URL, count, transition)
+	}
+}
+
+func (p *Pool) ConfigureHealthChecks(timeout time.Duration, failThreshold, riseThreshold int, path string) {
+	p.healthTimeout = timeout
+	p.failThreshold = failThreshold
+	p.riseThreshold = riseThreshold
+	p.healthPath = path
+	p.registry.configureHealth(failThreshold, riseThreshold)
 }
 
 func (p *Pool) HealthCheckContext(ctx context.Context, interval time.Duration) {
@@ -190,7 +363,7 @@ func (p *Pool) HealthCheckContext(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.CheckOnce()
+			p.CheckOnceContext(ctx)
 		}
 	}
 }
@@ -318,7 +491,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	pool.healthTimeout = cfg.HealthTimeout
+	pool.ConfigureHealthChecks(cfg.HealthTimeout, cfg.FailThreshold, cfg.RiseThreshold, cfg.HealthPath)
 	go pool.HealthCheckContext(ctx, cfg.HealthInterval)
 
 	srv := &http.Server{

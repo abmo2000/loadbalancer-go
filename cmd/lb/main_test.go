@@ -212,7 +212,9 @@ func TestFailover(t *testing.T) {
 
 	pool := newPoolFromBackends(t, b1, b2, b3)
 	b1.SetHealthy(false)
-	pool.CheckOnce()
+	for range 3 {
+		pool.CheckOnce()
+	}
 	backend1, ok := pool.registry.Get(b1.Target())
 	if !ok {
 		t.Fatal("backend-1 is missing from the registry")
@@ -233,7 +235,9 @@ func TestFailover(t *testing.T) {
 	}
 
 	b1.SetHealthy(true)
-	pool.CheckOnce()
+	for range 2 {
+		pool.CheckOnce()
+	}
 	seenRecovery := false
 	for i := 0; i < 6; i++ {
 		rec := doRequest(t, pool)
@@ -330,7 +334,9 @@ func TestAllBackendsDown(t *testing.T) {
 	for _, b := range []*controllableBackend{b1, b2, b3} {
 		b.SetHealthy(false)
 	}
-	pool.CheckOnce()
+	for range 3 {
+		pool.CheckOnce()
+	}
 
 	rec := doRequest(t, pool)
 	if rec.Code != http.StatusServiceUnavailable {
