@@ -21,27 +21,43 @@ import (
 )
 
 type Backend struct {
-	URL                  *url.URL
-	Proxy                *httputil.ReverseProxy
-	mu                   sync.RWMutex
-	alive                bool
-	activeConns          atomic.Int64
-	totalRequests        atomic.Uint64
-	totalFailures        atomic.Uint64
-	consecutiveFailures  atomic.Uint64
-	consecutiveSuccesses atomic.Uint64
-	lastCheck            time.Time
-	lastError            string
-	lastFailureKind      string
-	lastStateChange      time.Time
-	addedAt              time.Time
-	transport            *http.Transport
-	healthTransport      *http.Transport
-	healthClient         *http.Client
-	failThreshold        int
-	riseThreshold        int
-	checking             atomic.Bool
-	skipLogged           atomic.Bool
+	URL                        *url.URL
+	Proxy                      *httputil.ReverseProxy
+	mu                         sync.RWMutex
+	alive                      bool
+	activeConns                atomic.Int64
+	totalRequests              atomic.Uint64
+	totalFailures              atomic.Uint64
+	consecutiveFailures        atomic.Uint64
+	consecutiveSuccesses       atomic.Uint64
+	lastCheck                  time.Time
+	lastError                  string
+	lastFailureKind            string
+	lastStateChange            time.Time
+	addedAt                    time.Time
+	lastAliveChange            time.Time
+	lastTransitionTimes        [16]time.Time
+	transitionCount            int
+	transitionNext             int
+	transitionsSinceQuarantine int
+	quarantined                bool
+	quarantinedUntil           time.Time
+	quarantineLevel            int
+	quarantineLimitLogged      bool
+	transport                  *http.Transport
+	healthTransport            *http.Transport
+	healthClient               *http.Client
+	failThreshold              int
+	riseThreshold              int
+	checking                   atomic.Bool
+	skipLogged                 atomic.Bool
+	registry                   *Registry
+	now                        func() time.Time
+	flapWindow                 time.Duration
+	flapMaxTransitions         int
+	quarantineBase             time.Duration
+	quarantineMax              time.Duration
+	quarantineResetAfter       time.Duration
 }
 
 func NewBackend(u *url.URL, args ...time.Duration) *Backend {
@@ -55,12 +71,15 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 		responseTimeout = args[1]
 	}
 
-	now := time.Now()
+	nowFunc := time.Now
+	now := nowFunc()
 	b := &Backend{
 		URL:             u,
 		alive:           true,
 		addedAt:         now,
 		lastStateChange: now,
+		lastAliveChange: now,
+		now:             nowFunc,
 		failThreshold:   3,
 		riseThreshold:   2,
 	}
@@ -88,9 +107,7 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		if failures, kind, changed := b.recordProxyFailure(err); changed {
-			log.Printf("backend %s marked dead after %d failures: %s", b.URL, failures, kind)
-		}
+		logHealthEvents(b, b.recordProxyFailure(err))
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 	}
 	return b
@@ -99,75 +116,64 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 func (b *Backend) SetAlive(a bool) {
 	b.mu.Lock()
 	if b.alive != a {
-		b.lastStateChange = time.Now()
+		now := b.currentTime()
+		b.lastStateChange = now
+		b.lastAliveChange = now
+		b.appendTransitionLocked(now)
 	}
 	b.alive = a
+	b.quarantined = false
+	b.quarantinedUntil = time.Time{}
 	b.mu.Unlock()
 }
 
 func (b *Backend) IsAlive() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.alive
+	return b.alive && !b.quarantined
 }
 
-func (b *Backend) recordProxyFailure(err error) (uint64, string, bool) {
+type healthLogEvent struct {
+	kind        string
+	failureKind string
+	count       uint64
+	level       int
+	duration    time.Duration
+	transitions int
+	window      time.Duration
+	blocked     bool
+}
+
+func (b *Backend) recordProxyFailure(err error) []healthLogEvent {
+	if b.registry != nil {
+		return b.registry.recordProxyFailure(b, err)
+	}
 	kind := classifyFailure(err)
-	hardFailure := isHardProxyFailure(err)
 	b.totalFailures.Add(1)
 	b.mu.Lock()
 	failures := b.consecutiveFailures.Add(1)
-	b.consecutiveSuccesses.Store(0)
-	b.lastError = err.Error()
-	b.lastFailureKind = kind
-	changed := b.alive && (hardFailure || failures >= uint64(b.failThreshold))
+	changed := b.alive && (isHardProxyFailure(err) || failures >= uint64(b.failThreshold))
 	if changed {
 		b.alive = false
-		b.lastStateChange = time.Now()
+		b.lastStateChange = b.currentTime()
+		b.lastAliveChange = b.lastStateChange
+		b.appendTransitionLocked(b.lastStateChange)
 	}
-	b.mu.Unlock()
-	return failures, kind, changed
-}
-
-func (b *Backend) recordActiveCheck(success bool, kind string, checkErr error) (string, uint64) {
-	b.mu.Lock()
-	now := time.Now()
-	b.lastCheck = now
-	if success {
-		b.lastError = ""
-		b.lastFailureKind = ""
-		b.consecutiveFailures.Store(0)
-		if b.alive {
-			b.consecutiveSuccesses.Store(0)
-			b.mu.Unlock()
-			return "", 0
-		}
-		successes := b.consecutiveSuccesses.Add(1)
-		if successes >= uint64(b.riseThreshold) {
-			b.alive = true
-			b.lastStateChange = now
-			b.mu.Unlock()
-			return "recovered", successes
-		}
-		b.mu.Unlock()
-		return "", successes
-	}
-	b.lastError = checkErr.Error()
+	b.lastError = err.Error()
 	b.lastFailureKind = kind
 	b.consecutiveSuccesses.Store(0)
-	if !b.alive {
-		b.mu.Unlock()
-		return "", 0
-	}
-	failures := b.consecutiveFailures.Add(1)
-	if failures >= uint64(b.failThreshold) {
-		b.alive = false
-		b.lastStateChange = now
-		b.mu.Unlock()
-		return kind, failures
-	}
 	b.mu.Unlock()
-	return "", failures
+	if changed {
+		return []healthLogEvent{{kind: "dead", failureKind: kind, count: failures, window: b.flapWindow}}
+	}
+	return nil
+}
+
+func (b *Backend) recordActiveCheck(success bool, kind string, checkErr error) []healthLogEvent {
+	if b.registry != nil {
+		return b.registry.recordActiveCheck(b, success, kind, checkErr)
+	}
+	return nil
 }
 
 func (b *Backend) configureHealth(failThreshold, riseThreshold int) {
@@ -175,6 +181,72 @@ func (b *Backend) configureHealth(failThreshold, riseThreshold int) {
 	b.failThreshold = failThreshold
 	b.riseThreshold = riseThreshold
 	b.mu.Unlock()
+}
+
+func (b *Backend) configureFlap(window time.Duration, maxTransitions int, base, maximum, resetAfter time.Duration) {
+	b.mu.Lock()
+	b.flapWindow = window
+	b.flapMaxTransitions = maxTransitions
+	b.quarantineBase = base
+	b.quarantineMax = maximum
+	b.quarantineResetAfter = resetAfter
+	b.mu.Unlock()
+}
+
+func (b *Backend) currentTime() time.Time {
+	if b.now != nil {
+		return b.now()
+	}
+	return time.Now()
+}
+
+func (b *Backend) pruneTransitionsLocked(now time.Time) int {
+	if b.flapWindow <= 0 {
+		b.lastTransitionTimes = [16]time.Time{}
+		b.transitionCount = 0
+		b.transitionNext = 0
+		return 0
+	}
+	cutoff := now.Add(-b.flapWindow)
+	var retained [16]time.Time
+	count := 0
+	start := (b.transitionNext - b.transitionCount + len(b.lastTransitionTimes)) % len(b.lastTransitionTimes)
+	for i := 0; i < b.transitionCount; i++ {
+		transition := b.lastTransitionTimes[(start+i)%len(b.lastTransitionTimes)]
+		if !transition.Before(cutoff) {
+			retained[count] = transition
+			count++
+		}
+	}
+	b.lastTransitionTimes = retained
+	b.transitionCount = count
+	b.transitionNext = count % len(b.lastTransitionTimes)
+	return count
+}
+
+func (b *Backend) appendTransitionLocked(now time.Time) int {
+	b.pruneTransitionsLocked(now)
+	b.transitionsSinceQuarantine++
+	b.lastTransitionTimes[b.transitionNext] = now
+	b.transitionNext = (b.transitionNext + 1) % len(b.lastTransitionTimes)
+	if b.transitionCount < len(b.lastTransitionTimes) {
+		b.transitionCount++
+	}
+	count := b.pruneTransitionsLocked(now)
+	if count < b.flapMaxTransitions {
+		b.quarantineLimitLogged = false
+	}
+	return count
+}
+
+func (b *Backend) recentTransitionsLocked(now time.Time) int {
+	return b.pruneTransitionsLocked(now)
+}
+
+func (b *Backend) resetQuarantineLevelLocked(now time.Time) {
+	if b.alive && !b.quarantined && b.quarantineLevel > 0 && b.quarantineResetAfter > 0 && now.Sub(b.lastAliveChange) >= b.quarantineResetAfter {
+		b.quarantineLevel = 0
+	}
 }
 
 func classifyFailure(err error) string {
@@ -207,7 +279,15 @@ func isHardProxyFailure(err error) bool {
 }
 
 func (b *Backend) status() BackendStatus {
-	b.mu.RLock()
+	b.mu.Lock()
+	now := b.currentTime()
+	b.resetQuarantineLevelLocked(now)
+	state := "dead"
+	if b.quarantined {
+		state = "quarantined"
+	} else if b.alive {
+		state = "alive"
+	}
 	status := BackendStatus{
 		URL:                  b.URL.String(),
 		Alive:                b.alive,
@@ -218,8 +298,12 @@ func (b *Backend) status() BackendStatus {
 		LastFailureKind:      b.lastFailureKind,
 		LastStateChange:      b.lastStateChange,
 		AddedAt:              b.addedAt,
+		State:                state,
+		QuarantinedUntil:     b.quarantinedUntil,
+		QuarantineLevel:      b.quarantineLevel,
+		RecentTransitions:    b.recentTransitionsLocked(now),
 	}
-	b.mu.RUnlock()
+	b.mu.Unlock()
 	status.TotalRequests = b.totalRequests.Load()
 	status.TotalFailures = b.totalFailures.Load()
 	status.ActiveConns = b.activeConns.Load()
@@ -338,12 +422,25 @@ func (p *Pool) checkBackend(parent context.Context, backend *Backend) {
 }
 
 func (p *Pool) recordCheckResult(backend *Backend, success bool, kind string, checkErr error) {
-	transition, count := backend.recordActiveCheck(success, kind, checkErr)
-	switch transition {
-	case "recovered":
-		log.Printf("backend %s recovered after %d successes", backend.URL, count)
-	case "timeout", "connection_refused", "dns", "bad_status", "other":
-		log.Printf("backend %s marked dead after %d failures: %s", backend.URL, count, transition)
+	logHealthEvents(backend, backend.recordActiveCheck(success, kind, checkErr))
+}
+
+func logHealthEvents(backend *Backend, events []healthLogEvent) {
+	for _, event := range events {
+		switch event.kind {
+		case "dead":
+			log.Printf("backend %s marked dead after %d failures: %s", backend.URL, event.count, event.failureKind)
+		case "recovered":
+			if event.blocked {
+				log.Printf("backend %s recovered after %d successes; quarantine blocked by capacity safety limit", backend.URL, event.count)
+			} else {
+				log.Printf("backend %s recovered after %d successes", backend.URL, event.count)
+			}
+		case "quarantined":
+			log.Printf("backend %s quarantined for %s (level %d, %d transitions in %s)", backend.URL, event.duration, event.level, event.transitions, event.window)
+		case "released":
+			log.Printf("backend %s released from quarantine", backend.URL)
+		}
 	}
 }
 
@@ -353,6 +450,10 @@ func (p *Pool) ConfigureHealthChecks(timeout time.Duration, failThreshold, riseT
 	p.riseThreshold = riseThreshold
 	p.healthPath = path
 	p.registry.configureHealth(failThreshold, riseThreshold)
+}
+
+func (p *Pool) ConfigureFlapProtection(window time.Duration, maxTransitions int, base, maximum, resetAfter time.Duration, maxPercent int) {
+	p.registry.ConfigureFlapProtection(window, maxTransitions, base, maximum, resetAfter, maxPercent)
 }
 
 func (p *Pool) HealthCheckContext(ctx context.Context, interval time.Duration) {
@@ -492,6 +593,7 @@ func main() {
 		log.Fatal(err)
 	}
 	pool.ConfigureHealthChecks(cfg.HealthTimeout, cfg.FailThreshold, cfg.RiseThreshold, cfg.HealthPath)
+	pool.ConfigureFlapProtection(cfg.FlapWindow, cfg.FlapMaxTransitions, cfg.QuarantineBase, cfg.QuarantineMax, cfg.QuarantineResetAfter, cfg.MaxQuarantinePercent)
 	go pool.HealthCheckContext(ctx, cfg.HealthInterval)
 
 	srv := &http.Server{

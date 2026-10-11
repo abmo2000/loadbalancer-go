@@ -35,27 +35,33 @@ func TestLoadConfig_Defaults(t *testing.T) {
 			t.Fatalf("Backends[%d] = %q; want %q", i, cfg.Backends[i], want.Backends[i])
 		}
 	}
-	if cfg.HealthInterval != want.HealthInterval || cfg.HealthTimeout != want.HealthTimeout || cfg.FailThreshold != want.FailThreshold || cfg.RiseThreshold != want.RiseThreshold || cfg.HealthPath != want.HealthPath || cfg.DialTimeout != want.DialTimeout || cfg.ResponseTimeout != want.ResponseTimeout || cfg.ReadHeaderTimeout != want.ReadHeaderTimeout || cfg.ReadTimeout != want.ReadTimeout || cfg.WriteTimeout != want.WriteTimeout || cfg.IdleTimeout != want.IdleTimeout || cfg.ShutdownTimeout != want.ShutdownTimeout {
+	if cfg.HealthInterval != want.HealthInterval || cfg.HealthTimeout != want.HealthTimeout || cfg.FailThreshold != want.FailThreshold || cfg.RiseThreshold != want.RiseThreshold || cfg.HealthPath != want.HealthPath || cfg.FlapWindow != want.FlapWindow || cfg.FlapMaxTransitions != want.FlapMaxTransitions || cfg.QuarantineBase != want.QuarantineBase || cfg.QuarantineMax != want.QuarantineMax || cfg.QuarantineResetAfter != want.QuarantineResetAfter || cfg.MaxQuarantinePercent != want.MaxQuarantinePercent || cfg.DialTimeout != want.DialTimeout || cfg.ResponseTimeout != want.ResponseTimeout || cfg.ReadHeaderTimeout != want.ReadHeaderTimeout || cfg.ReadTimeout != want.ReadTimeout || cfg.WriteTimeout != want.WriteTimeout || cfg.IdleTimeout != want.IdleTimeout || cfg.ShutdownTimeout != want.ShutdownTimeout {
 		t.Fatalf("unexpected default values: %#v; want %#v", cfg, want)
 	}
 }
 
 func TestLoadConfig_EnvOverridesDefaults(t *testing.T) {
 	env := map[string]string{
-		"LB_LISTEN_ADDR":           ":9090",
-		"LB_BACKENDS":              "http://10.0.0.5:8000, http://10.0.0.6:8000",
-		"LB_HEALTH_INTERVAL":       "250ms",
-		"LB_HEALTH_TIMEOUT":        "750ms",
-		"LB_HEALTH_FAIL_THRESHOLD": "4",
-		"LB_HEALTH_RISE_THRESHOLD": "5",
-		"LB_HEALTH_PATH":           "/healthz",
-		"LB_DIAL_TIMEOUT":          "2s",
-		"LB_RESPONSE_TIMEOUT":      "15s",
-		"LB_READ_HEADER_TIMEOUT":   "4s",
-		"LB_READ_TIMEOUT":          "12s",
-		"LB_WRITE_TIMEOUT":         "20s",
-		"LB_IDLE_TIMEOUT":          "30s",
-		"LB_SHUTDOWN_TIMEOUT":      "18s",
+		"LB_LISTEN_ADDR":            ":9090",
+		"LB_BACKENDS":               "http://10.0.0.5:8000, http://10.0.0.6:8000",
+		"LB_HEALTH_INTERVAL":        "250ms",
+		"LB_HEALTH_TIMEOUT":         "750ms",
+		"LB_HEALTH_FAIL_THRESHOLD":  "4",
+		"LB_HEALTH_RISE_THRESHOLD":  "5",
+		"LB_HEALTH_PATH":            "/healthz",
+		"LB_FLAP_WINDOW":            "90s",
+		"LB_FLAP_MAX_TRANSITIONS":   "5",
+		"LB_QUARANTINE_BASE":        "10s",
+		"LB_QUARANTINE_MAX":         "2m",
+		"LB_QUARANTINE_RESET_AFTER": "4m",
+		"LB_MAX_QUARANTINE_PERCENT": "40",
+		"LB_DIAL_TIMEOUT":           "2s",
+		"LB_RESPONSE_TIMEOUT":       "15s",
+		"LB_READ_HEADER_TIMEOUT":    "4s",
+		"LB_READ_TIMEOUT":           "12s",
+		"LB_WRITE_TIMEOUT":          "20s",
+		"LB_IDLE_TIMEOUT":           "30s",
+		"LB_SHUTDOWN_TIMEOUT":       "18s",
 	}
 	cfg, err := LoadConfig(envLookup(env), nil)
 	if err != nil {
@@ -67,27 +73,33 @@ func TestLoadConfig_EnvOverridesDefaults(t *testing.T) {
 	if got, want := cfg.Backends, []string{"http://10.0.0.5:8000", "http://10.0.0.6:8000"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("Backends = %#v; want %#v", got, want)
 	}
-	if cfg.HealthInterval != 250*time.Millisecond || cfg.HealthTimeout != 750*time.Millisecond || cfg.FailThreshold != 4 || cfg.RiseThreshold != 5 || cfg.HealthPath != "/healthz" || cfg.DialTimeout != 2*time.Second || cfg.ResponseTimeout != 15*time.Second || cfg.ReadHeaderTimeout != 4*time.Second || cfg.ReadTimeout != 12*time.Second || cfg.WriteTimeout != 20*time.Second || cfg.IdleTimeout != 30*time.Second || cfg.ShutdownTimeout != 18*time.Second {
+	if cfg.HealthInterval != 250*time.Millisecond || cfg.HealthTimeout != 750*time.Millisecond || cfg.FailThreshold != 4 || cfg.RiseThreshold != 5 || cfg.HealthPath != "/healthz" || cfg.FlapWindow != 90*time.Second || cfg.FlapMaxTransitions != 5 || cfg.QuarantineBase != 10*time.Second || cfg.QuarantineMax != 2*time.Minute || cfg.QuarantineResetAfter != 4*time.Minute || cfg.MaxQuarantinePercent != 40 || cfg.DialTimeout != 2*time.Second || cfg.ResponseTimeout != 15*time.Second || cfg.ReadHeaderTimeout != 4*time.Second || cfg.ReadTimeout != 12*time.Second || cfg.WriteTimeout != 20*time.Second || cfg.IdleTimeout != 30*time.Second || cfg.ShutdownTimeout != 18*time.Second {
 		t.Fatalf("unexpected env-derived config: %#v", cfg)
 	}
 }
 
 func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	env := map[string]string{
-		"LB_LISTEN_ADDR":           ":9090",
-		"LB_BACKENDS":              "http://10.0.0.5:8000",
-		"LB_HEALTH_INTERVAL":       "250ms",
-		"LB_HEALTH_TIMEOUT":        "750ms",
-		"LB_HEALTH_FAIL_THRESHOLD": "4",
-		"LB_HEALTH_RISE_THRESHOLD": "5",
-		"LB_HEALTH_PATH":           "/healthz",
-		"LB_DIAL_TIMEOUT":          "2s",
-		"LB_RESPONSE_TIMEOUT":      "15s",
-		"LB_READ_HEADER_TIMEOUT":   "4s",
-		"LB_READ_TIMEOUT":          "12s",
-		"LB_WRITE_TIMEOUT":         "20s",
-		"LB_IDLE_TIMEOUT":          "30s",
-		"LB_SHUTDOWN_TIMEOUT":      "18s",
+		"LB_LISTEN_ADDR":            ":9090",
+		"LB_BACKENDS":               "http://10.0.0.5:8000",
+		"LB_HEALTH_INTERVAL":        "250ms",
+		"LB_HEALTH_TIMEOUT":         "750ms",
+		"LB_HEALTH_FAIL_THRESHOLD":  "4",
+		"LB_HEALTH_RISE_THRESHOLD":  "5",
+		"LB_HEALTH_PATH":            "/healthz",
+		"LB_FLAP_WINDOW":            "90s",
+		"LB_FLAP_MAX_TRANSITIONS":   "5",
+		"LB_QUARANTINE_BASE":        "10s",
+		"LB_QUARANTINE_MAX":         "2m",
+		"LB_QUARANTINE_RESET_AFTER": "4m",
+		"LB_MAX_QUARANTINE_PERCENT": "40",
+		"LB_DIAL_TIMEOUT":           "2s",
+		"LB_RESPONSE_TIMEOUT":       "15s",
+		"LB_READ_HEADER_TIMEOUT":    "4s",
+		"LB_READ_TIMEOUT":           "12s",
+		"LB_WRITE_TIMEOUT":          "20s",
+		"LB_IDLE_TIMEOUT":           "30s",
+		"LB_SHUTDOWN_TIMEOUT":       "18s",
 	}
 	cfg, err := LoadConfig(envLookup(env), []string{
 		"-listen", ":9191",
@@ -97,6 +109,12 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 		"-health-fail-threshold", "6",
 		"-health-rise-threshold", "7",
 		"-health-path", "/ready",
+		"-flap-window", "120s",
+		"-flap-max-transitions", "6",
+		"-quarantine-base", "15s",
+		"-quarantine-max", "3m",
+		"-quarantine-reset-after", "6m",
+		"-max-quarantine-percent", "60",
 		"-dial-timeout", "3s",
 		"-response-timeout", "16s",
 		"-read-header-timeout", "5s",
@@ -114,7 +132,7 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	if got, want := cfg.Backends, []string{"http://10.0.0.7:8000", "http://10.0.0.8:8000"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("Backends = %#v; want %#v", got, want)
 	}
-	if cfg.HealthInterval != 300*time.Millisecond || cfg.HealthTimeout != 900*time.Millisecond || cfg.FailThreshold != 6 || cfg.RiseThreshold != 7 || cfg.HealthPath != "/ready" || cfg.DialTimeout != 3*time.Second || cfg.ResponseTimeout != 16*time.Second || cfg.ReadHeaderTimeout != 5*time.Second || cfg.ReadTimeout != 13*time.Second || cfg.WriteTimeout != 21*time.Second || cfg.IdleTimeout != 31*time.Second || cfg.ShutdownTimeout != 19*time.Second {
+	if cfg.HealthInterval != 300*time.Millisecond || cfg.HealthTimeout != 900*time.Millisecond || cfg.FailThreshold != 6 || cfg.RiseThreshold != 7 || cfg.HealthPath != "/ready" || cfg.FlapWindow != 120*time.Second || cfg.FlapMaxTransitions != 6 || cfg.QuarantineBase != 15*time.Second || cfg.QuarantineMax != 3*time.Minute || cfg.QuarantineResetAfter != 6*time.Minute || cfg.MaxQuarantinePercent != 60 || cfg.DialTimeout != 3*time.Second || cfg.ResponseTimeout != 16*time.Second || cfg.ReadHeaderTimeout != 5*time.Second || cfg.ReadTimeout != 13*time.Second || cfg.WriteTimeout != 21*time.Second || cfg.IdleTimeout != 31*time.Second || cfg.ShutdownTimeout != 19*time.Second {
 		t.Fatalf("unexpected flag-derived config: %#v", cfg)
 	}
 }
@@ -436,9 +454,56 @@ func TestHealthCheckConfigValidation(t *testing.T) {
 	}
 }
 
+func TestFlapConfigValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		setting string
+		value   string
+	}{
+		{"negative transition limit", map[string]string{"LB_FLAP_MAX_TRANSITIONS": "-1"}, "LB_FLAP_MAX_TRANSITIONS", "-1"},
+		{"single transition limit", map[string]string{"LB_FLAP_MAX_TRANSITIONS": "1"}, "LB_FLAP_MAX_TRANSITIONS", "1"},
+		{"zero max percentage", map[string]string{"LB_MAX_QUARANTINE_PERCENT": "0"}, "LB_MAX_QUARANTINE_PERCENT", "0"},
+		{"percentage over limit", map[string]string{"LB_MAX_QUARANTINE_PERCENT": "101"}, "LB_MAX_QUARANTINE_PERCENT", "101"},
+		{"base exceeds max", map[string]string{"LB_QUARANTINE_BASE": "40s", "LB_QUARANTINE_MAX": "30s"}, "LB_QUARANTINE_BASE", "40s"},
+		{"window too small", map[string]string{"LB_FLAP_WINDOW": "24s"}, "LB_FLAP_WINDOW", "24s"},
+		{"negative base", map[string]string{"LB_QUARANTINE_BASE": "-1s"}, "LB_QUARANTINE_BASE", "-1s"},
+		{"max over 24 hours", map[string]string{"LB_QUARANTINE_MAX": "25h"}, "LB_QUARANTINE_MAX", "25h0m0s"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := LoadConfig(envLookup(test.env), nil)
+			if err != nil {
+				assertConfigError(t, err, test.setting, test.value)
+				return
+			}
+			assertConfigError(t, cfg.Validate(), test.setting, test.value)
+		})
+	}
+}
+
+func TestWarnings_QuarantineBaseTooShort(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.QuarantineBase = 5 * time.Second
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+	warnings := cfg.Warnings()
+	found := false
+	for _, warning := range warnings {
+		if strings.Contains(warning, "LB_QUARANTINE_BASE") && strings.Contains(warning, "10s") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Warnings = %#v; want short quarantine hold warning", warnings)
+	}
+}
+
 func TestWarnings_HealthDetectionTime(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.HealthInterval = 30 * time.Second
+	cfg.FlapMaxTransitions = 0
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate returned error: %v", err)
 	}

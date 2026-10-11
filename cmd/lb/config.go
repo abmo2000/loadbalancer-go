@@ -23,39 +23,51 @@ var defaultBackends = []string{
 }
 
 type Config struct {
-	ListenAddr        string
-	Backends          []string
-	HealthInterval    time.Duration
-	HealthTimeout     time.Duration
-	FailThreshold     int
-	RiseThreshold     int
-	HealthPath        string
-	DialTimeout       time.Duration
-	ResponseTimeout   time.Duration
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	ShutdownTimeout   time.Duration
-	CheckOnly         bool
+	ListenAddr           string
+	Backends             []string
+	HealthInterval       time.Duration
+	HealthTimeout        time.Duration
+	FailThreshold        int
+	RiseThreshold        int
+	HealthPath           string
+	FlapWindow           time.Duration
+	FlapMaxTransitions   int
+	QuarantineBase       time.Duration
+	QuarantineMax        time.Duration
+	QuarantineResetAfter time.Duration
+	MaxQuarantinePercent int
+	DialTimeout          time.Duration
+	ResponseTimeout      time.Duration
+	ReadHeaderTimeout    time.Duration
+	ReadTimeout          time.Duration
+	WriteTimeout         time.Duration
+	IdleTimeout          time.Duration
+	ShutdownTimeout      time.Duration
+	CheckOnly            bool
 }
 
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:        ":8080",
-		Backends:          append([]string(nil), defaultBackends...),
-		HealthInterval:    5 * time.Second,
-		HealthTimeout:     2 * time.Second,
-		FailThreshold:     3,
-		RiseThreshold:     2,
-		HealthPath:        "/",
-		DialTimeout:       3 * time.Second,
-		ResponseTimeout:   10 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		ShutdownTimeout:   15 * time.Second,
+		ListenAddr:           ":8080",
+		Backends:             append([]string(nil), defaultBackends...),
+		HealthInterval:       5 * time.Second,
+		HealthTimeout:        2 * time.Second,
+		FailThreshold:        3,
+		RiseThreshold:        2,
+		HealthPath:           "/",
+		FlapWindow:           60 * time.Second,
+		FlapMaxTransitions:   4,
+		QuarantineBase:       30 * time.Second,
+		QuarantineMax:        5 * time.Minute,
+		QuarantineResetAfter: 5 * time.Minute,
+		MaxQuarantinePercent: 50,
+		DialTimeout:          3 * time.Second,
+		ResponseTimeout:      10 * time.Second,
+		ReadHeaderTimeout:    5 * time.Second,
+		ReadTimeout:          15 * time.Second,
+		WriteTimeout:         30 * time.Second,
+		IdleTimeout:          60 * time.Second,
+		ShutdownTimeout:      15 * time.Second,
 	}
 }
 
@@ -105,6 +117,10 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 		{"LB_WRITE_TIMEOUT", &cfg.WriteTimeout},
 		{"LB_IDLE_TIMEOUT", &cfg.IdleTimeout},
 		{"LB_SHUTDOWN_TIMEOUT", &cfg.ShutdownTimeout},
+		{"LB_FLAP_WINDOW", &cfg.FlapWindow},
+		{"LB_QUARANTINE_BASE", &cfg.QuarantineBase},
+		{"LB_QUARANTINE_MAX", &cfg.QuarantineMax},
+		{"LB_QUARANTINE_RESET_AFTER", &cfg.QuarantineResetAfter},
 	}
 	var parseProblems []error
 	for _, setting := range durationSettings {
@@ -145,6 +161,23 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	if value, ok := lookupEnvValue(getenv, "LB_HEALTH_PATH"); ok {
 		cfg.HealthPath = value
 	}
+	integerSettings := []struct {
+		name   string
+		target *int
+	}{
+		{"LB_FLAP_MAX_TRANSITIONS", &cfg.FlapMaxTransitions},
+		{"LB_MAX_QUARANTINE_PERCENT", &cfg.MaxQuarantinePercent},
+	}
+	for _, setting := range integerSettings {
+		if value, ok := lookupEnvValue(getenv, setting.name); ok {
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				parseProblems = append(parseProblems, fmt.Errorf("%s: %q must be an integer", setting.name, value))
+				continue
+			}
+			*setting.target = parsed
+		}
+	}
 
 	fs := flag.NewFlagSet("loadbalancer-go", flag.ContinueOnError)
 	var flagOutput bytes.Buffer
@@ -158,6 +191,12 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	fs.IntVar(&cfg.FailThreshold, "health-fail-threshold", cfg.FailThreshold, "consecutive failures before marking a backend dead")
 	fs.IntVar(&cfg.RiseThreshold, "health-rise-threshold", cfg.RiseThreshold, "consecutive active successes before recovering a backend")
 	fs.StringVar(&cfg.HealthPath, "health-path", cfg.HealthPath, "path used for active health checks")
+	fs.DurationVar(&cfg.FlapWindow, "flap-window", cfg.FlapWindow, "sliding window for backend state transitions")
+	fs.IntVar(&cfg.FlapMaxTransitions, "flap-max-transitions", cfg.FlapMaxTransitions, "transitions in the flap window before quarantine; 0 disables")
+	fs.DurationVar(&cfg.QuarantineBase, "quarantine-base", cfg.QuarantineBase, "initial quarantine hold-down")
+	fs.DurationVar(&cfg.QuarantineMax, "quarantine-max", cfg.QuarantineMax, "maximum quarantine hold-down")
+	fs.DurationVar(&cfg.QuarantineResetAfter, "quarantine-reset-after", cfg.QuarantineResetAfter, "alive duration after which quarantine level resets")
+	fs.IntVar(&cfg.MaxQuarantinePercent, "max-quarantine-percent", cfg.MaxQuarantinePercent, "maximum percentage of registered backends quarantined")
 	fs.DurationVar(&cfg.DialTimeout, "dial-timeout", cfg.DialTimeout, "backend dial timeout")
 	fs.DurationVar(&cfg.ResponseTimeout, "response-timeout", cfg.ResponseTimeout, "backend response-header timeout")
 	fs.DurationVar(&cfg.ReadHeaderTimeout, "read-header-timeout", cfg.ReadHeaderTimeout, "server read-header timeout")
@@ -201,6 +240,35 @@ func (c *Config) Validate() error {
 	}
 	if !strings.HasPrefix(c.HealthPath, "/") || strings.ContainsAny(c.HealthPath, " \t\r\n?#") || utf8.RuneCountInString(c.HealthPath) > 200 {
 		problems = append(problems, fmt.Errorf("LB_HEALTH_PATH: %q must start with /, contain no spaces, ? or #, and be at most 200 characters", c.HealthPath))
+	}
+	if c.FlapMaxTransitions != 0 && (c.FlapMaxTransitions < 2 || c.FlapMaxTransitions > 16) {
+		problems = append(problems, fmt.Errorf("LB_FLAP_MAX_TRANSITIONS: %q must be 0 (disabled) or an integer from 2 to 16", strconv.Itoa(c.FlapMaxTransitions)))
+	}
+	if c.MaxQuarantinePercent < 1 || c.MaxQuarantinePercent > 100 {
+		problems = append(problems, fmt.Errorf("LB_MAX_QUARANTINE_PERCENT: %q must be an integer from 1 to 100", strconv.Itoa(c.MaxQuarantinePercent)))
+	}
+	if c.FlapMaxTransitions != 0 {
+		flapDurations := []struct {
+			name  string
+			value time.Duration
+		}{
+			{"LB_FLAP_WINDOW", c.FlapWindow},
+			{"LB_QUARANTINE_BASE", c.QuarantineBase},
+			{"LB_QUARANTINE_MAX", c.QuarantineMax},
+			{"LB_QUARANTINE_RESET_AFTER", c.QuarantineResetAfter},
+		}
+		for _, setting := range flapDurations {
+			if setting.value <= 0 || setting.value > maxConfigDuration {
+				problems = append(problems, fmt.Errorf("%s: %q must be greater than 0 and no more than 24h", setting.name, setting.value))
+			}
+		}
+		if c.QuarantineBase > c.QuarantineMax {
+			problems = append(problems, fmt.Errorf("LB_QUARANTINE_BASE: %q must be less than or equal to LB_QUARANTINE_MAX %q", c.QuarantineBase, c.QuarantineMax))
+		}
+		minimumWindow := c.HealthInterval * time.Duration(c.FailThreshold+c.RiseThreshold)
+		if minimumWindow > 0 && c.FlapWindow < minimumWindow {
+			problems = append(problems, fmt.Errorf("LB_FLAP_WINDOW: %q must be at least LB_HEALTH_INTERVAL * (LB_HEALTH_FAIL_THRESHOLD + LB_HEALTH_RISE_THRESHOLD) = %s", c.FlapWindow, minimumWindow))
+		}
 	}
 
 	listenHost, listenPort, listenValid, listenProblems := validateListenAddr(c.ListenAddr)
@@ -401,6 +469,9 @@ func (c Config) Warnings() []string {
 			warnings = append(warnings, fmt.Sprintf("LB_HEALTH_INTERVAL %q times LB_HEALTH_FAIL_THRESHOLD %d means dead backends may take %s to detect", c.HealthInterval, c.FailThreshold, detectionTime))
 		}
 	}
+	if c.FlapMaxTransitions != 0 && c.HealthInterval > 0 && c.RiseThreshold > 0 && c.QuarantineBase < c.HealthInterval*time.Duration(c.RiseThreshold) {
+		warnings = append(warnings, fmt.Sprintf("LB_QUARANTINE_BASE %q is shorter than LB_HEALTH_INTERVAL * LB_HEALTH_RISE_THRESHOLD (%s); the hold-down may end before normal recovery is possible", c.QuarantineBase, c.HealthInterval*time.Duration(c.RiseThreshold)))
+	}
 	return warnings
 }
 
@@ -414,7 +485,7 @@ func Preflight(c Config) error {
 
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"listen=%s backends=%v healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
+		"listen=%s backends=%v healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s flapWindow=%s flapMaxTransitions=%d quarantineBase=%s quarantineMax=%s quarantineResetAfter=%s maxQuarantinePercent=%d dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
 		c.ListenAddr,
 		c.Backends,
 		c.HealthInterval,
@@ -422,6 +493,12 @@ func (c Config) String() string {
 		c.FailThreshold,
 		c.RiseThreshold,
 		c.HealthPath,
+		c.FlapWindow,
+		c.FlapMaxTransitions,
+		c.QuarantineBase,
+		c.QuarantineMax,
+		c.QuarantineResetAfter,
+		c.MaxQuarantinePercent,
 		c.DialTimeout,
 		c.ResponseTimeout,
 		c.ReadHeaderTimeout,

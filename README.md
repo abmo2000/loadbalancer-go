@@ -259,7 +259,14 @@ Removing a backend prevents future snapshots from selecting or checking it and c
 - `ActiveConns`: requests currently being proxied through the backend.
 - `LastCheck`: time of the most recent health check.
 - `LastError`: most recent proxy or health-check error, cleared by a successful health check.
+- `LastFailureKind`: most recent classified failure (`timeout`, `connection_refused`, `dns`, `bad_status`, or `other`).
+- `LastStateChange`: time of the most recent alive/dead/quarantine transition.
 - `AddedAt`: time the backend was registered.
+- `ConsecutiveSuccesses`: consecutive active successes toward recovery.
+- `State`: `alive`, `dead`, or `quarantined`.
+- `QuarantinedUntil`: hold-down deadline, zero when not quarantined.
+- `QuarantineLevel`: current exponential hold-down level.
+- `RecentTransitions`: alive/dead transitions still inside the flap window.
 
 Registry changes are in memory only and are lost when the process restarts. Active failures use the configured threshold, and recovery requires consecutive successful active checks. Passive hard dial failures still mark a backend dead immediately.
 
@@ -338,6 +345,59 @@ Health-check tests cover these behaviors:
 - `TestHealthCheckConfigValidation`: covers threshold bounds and health-path requirements.
 - `TestWarnings_HealthDetectionTime`: checks the warning for a long failure-detection window.
 - `TestRegistryRaceConcurrentChanges`: exercises traffic, checks, registry updates, and status snapshots concurrently.
+
+## Flap protection (Phase 1)
+
+Thresholds provide fast hysteresis for individual failures: a backend needs several consecutive failures to go down and several successes to return. Quarantine addresses slower oscillation that can still pass those thresholds repeatedly. For example, a backend that is down for 15 seconds, healthy for 10 seconds, and repeats this cycle can re-enter rotation on each recovery; four alive/dead transitions within the window trigger a hold-down.
+
+```text
+  +-------+ -- FailThreshold failures --> +------+
+  | ALIVE |                               | DEAD |
+  +-------+ <-- RiseThreshold successes --+------+
+      |                                      ^
+      | flap limit reached on recovery      | hold expires
+      v                                      |
+  +---------------+ ------------------------+
+  | QUARANTINED   |
+  +---------------+
+
+DEAD + failure -> remain DEAD; reset recovery streak
+QUARANTINED + active checks -> remain unavailable until hold expires
+```
+
+| Setting | Flag | Environment | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| Flap window | `-flap-window` | `LB_FLAP_WINDOW` | `60s` | Sliding window for alive/dead transitions |
+| Transition limit | `-flap-max-transitions` | `LB_FLAP_MAX_TRANSITIONS` | `4` | In-window transitions before quarantine; `0` disables flap protection |
+| Quarantine base | `-quarantine-base` | `LB_QUARANTINE_BASE` | `30s` | First hold-down duration |
+| Quarantine maximum | `-quarantine-max` | `LB_QUARANTINE_MAX` | `5m` | Cap for exponential hold-down |
+| Quarantine reset | `-quarantine-reset-after` | `LB_QUARANTINE_RESET_AFTER` | `5m` | Stable alive time required to reset the level |
+| Capacity limit | `-max-quarantine-percent` | `LB_MAX_QUARANTINE_PERCENT` | `50` | Maximum percentage of backends quarantined at once |
+
+The first hold uses `QuarantineBase`; each later quarantine doubles the previous duration up to `QuarantineMax`. With the defaults, holds are `30s`, `60s`, `120s`, `240s`, then capped at `5m`. The level resets after five minutes alive without a transition. Quarantine is re-armed after each hold so old transitions cannot immediately impose the same hold again.
+
+The capacity limit is `floor(total * MaxQuarantinePercent / 100)`, and at least one healthy, non-quarantined backend must remain. If the limit blocks quarantine, normal threshold recovery applies and one log line explains the decision. The limit never blocks normal failure ejection: actively failing backends still become dead at their threshold, and passive hard dial failures still eject immediately.
+
+The clock is injected through Registry and Backend so tests can advance transition windows, hold-down deadlines, and level resets deterministically without sleeping.
+
+Known limits: no per-backend overrides are available; transition history and quarantine level are in memory and reset on restart.
+
+`cmd/backend -flaky-period 4s` is a testing aid: it alternates successful and `503` responses on `/` in four-second periods measured from process start. The `/slow` endpoint is unchanged; leave this flag at its default `0` outside tests.
+
+Flap-protection tests cover these behaviors:
+
+- `TestFlapProtectionDisabledKeepsThresholdBehavior`: confirms zero disables quarantine without changing thresholds.
+- `TestFourTransitionsQuarantineAndHoldDown`: verifies four transitions trigger quarantine and checks stay fresh without early recovery.
+- `TestExpiredQuarantineStillRequiresRiseThreshold`: verifies an expired hold still needs the normal active-success streak.
+- `TestQuarantineExponentialGrowthAndCap`: verifies hold growth and the configured maximum.
+- `TestQuarantineLevelResetsAfterStableAlivePeriod`: checks stable uptime resets the next hold to its base.
+- `TestTransitionsOutsideWindowDoNotQuarantine`: verifies old transitions expire from the sliding window.
+- `TestQuarantineCapacitySafety`: verifies the percentage cap and that a single backend is never quarantined.
+- `TestCapacityLimitDoesNotBlockRealFailureEjection`: confirms genuine failures bypass the quarantine capacity limit.
+- `TestQuarantineTransitionLogsOnlyOnce`: checks logs occur only when entering or leaving quarantine.
+- `TestFlapRegistryRace`: races client traffic, health checks, transition changes, Add/Remove, and status snapshots.
+- `TestFlapConfigValidation`: covers setting ranges, base/max, and minimum window validation.
+- `TestWarnings_QuarantineBaseTooShort`: verifies the short-hold warning.
 
 ## Design notes
 

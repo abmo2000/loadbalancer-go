@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -767,5 +769,310 @@ func TestFailureClassification(t *testing.T) {
 				t.Fatalf("isHardProxyFailure = %v; want %v", got, test.hard)
 			}
 		})
+	}
+}
+
+type flapFakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newFlapFakeClock() *flapFakeClock {
+	return &flapFakeClock{now: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)}
+}
+
+func (clock *flapFakeClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *flapFakeClock) Advance(duration time.Duration) {
+	clock.mu.Lock()
+	clock.now = clock.now.Add(duration)
+	clock.mu.Unlock()
+}
+
+type flapFixture struct {
+	pool     *Pool
+	registry *Registry
+	clock    *flapFakeClock
+	servers  []*httptest.Server
+	healthy  []*atomic.Bool
+}
+
+func newFlapFixture(t *testing.T, count int, maxTransitions int, base, maximum, resetAfter time.Duration, maxPercent int) *flapFixture {
+	t.Helper()
+	clock := newFlapFakeClock()
+	registry := NewRegistry(time.Second, time.Second)
+	registry.now = clock.Now
+	registry.ConfigureFlapProtection(time.Minute, maxTransitions, base, maximum, resetAfter, maxPercent)
+	fixture := &flapFixture{registry: registry, clock: clock}
+	for index := 0; index < count; index++ {
+		health := &atomic.Bool{}
+		health.Store(true)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if !health.Load() {
+				http.Error(w, "unhealthy", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = io.WriteString(w, "healthy")
+		}))
+		t.Cleanup(server.Close)
+		fixture.servers = append(fixture.servers, server)
+		fixture.healthy = append(fixture.healthy, health)
+		if _, err := registry.Add(server.URL); err != nil {
+			t.Fatalf("Add backend: %v", err)
+		}
+	}
+	fixture.pool = &Pool{registry: registry, healthTimeout: time.Second, failThreshold: 3, riseThreshold: 2, healthPath: "/"}
+	fixture.pool.ConfigureHealthChecks(time.Second, 3, 2, "/")
+	return fixture
+}
+
+func (fixture *flapFixture) backend(index int) *Backend {
+	backend, _ := fixture.registry.Get(fixture.servers[index].URL)
+	return backend
+}
+
+func (fixture *flapFixture) failToDead(index int) {
+	fixture.healthy[index].Store(false)
+	for range 3 {
+		fixture.pool.CheckOnce()
+	}
+}
+
+func (fixture *flapFixture) recoverToAlive(index int) {
+	fixture.healthy[index].Store(true)
+	for range 2 {
+		fixture.pool.CheckOnce()
+	}
+}
+
+func (fixture *flapFixture) flapCycle(index int) {
+	fixture.failToDead(index)
+	fixture.clock.Advance(time.Second)
+	fixture.recoverToAlive(index)
+}
+
+func TestFlapProtectionDisabledKeepsThresholdBehavior(t *testing.T) {
+	fixture := newFlapFixture(t, 1, 0, 10*time.Second, time.Minute, time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	status := fixture.backend(0).status()
+	if status.State != "alive" || fixture.pool.Next() == nil {
+		t.Fatalf("disabled flap protection changed threshold behavior: %#v", status)
+	}
+}
+
+func TestFourTransitionsQuarantineAndHoldDown(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	backend := fixture.backend(0)
+	status := backend.status()
+	if status.State != "quarantined" || status.QuarantineLevel != 1 || status.RecentTransitions != 4 || !status.QuarantinedUntil.Equal(fixture.clock.Now().Add(10*time.Second)) {
+		t.Fatalf("quarantine status = %#v; want level 1, 4 transitions, 10s hold", status)
+	}
+	if fixture.pool.Next() == backend {
+		t.Fatal("quarantined backend remained selectable")
+	}
+	fixture.healthy[0].Store(true)
+	for range 2 {
+		fixture.pool.CheckOnce()
+	}
+	if status = backend.status(); status.State != "quarantined" || status.ConsecutiveSuccesses != 0 {
+		t.Fatalf("successes during hold-down changed state: %#v", status)
+	}
+}
+
+func TestExpiredQuarantineStillRequiresRiseThreshold(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	backend := fixture.backend(0)
+	fixture.clock.Advance(10 * time.Second)
+	fixture.pool.CheckOnce()
+	status := backend.status()
+	if status.State != "dead" || !status.QuarantinedUntil.IsZero() || status.ConsecutiveSuccesses != 1 {
+		t.Fatalf("after first post-hold success status = %#v; want dead with one success", status)
+	}
+	if fixture.pool.Next() == backend {
+		t.Fatal("backend became selectable before RiseThreshold")
+	}
+	fixture.pool.CheckOnce()
+	if status = backend.status(); status.State != "alive" || fixture.pool.Next() != backend {
+		t.Fatalf("backend did not return after RiseThreshold: %#v", status)
+	}
+}
+
+func TestQuarantineExponentialGrowthAndCap(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, 15*time.Second, 5*time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	backend := fixture.backend(0)
+	firstUntil := backend.status().QuarantinedUntil
+	if duration := firstUntil.Sub(fixture.clock.Now()); duration != 10*time.Second {
+		t.Fatalf("first hold = %v; want 10s", duration)
+	}
+	fixture.clock.Advance(10 * time.Second)
+	fixture.pool.CheckOnce()
+	fixture.pool.CheckOnce()
+	if backend.status().State != "alive" {
+		t.Fatal("backend did not recover after hold and two active successes")
+	}
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	status := backend.status()
+	if status.State != "quarantined" || status.QuarantineLevel != 2 || status.QuarantinedUntil.Sub(fixture.clock.Now()) != 15*time.Second {
+		t.Fatalf("second capped hold status = %#v; want level 2, capped at 15s", status)
+	}
+}
+
+func TestQuarantineLevelResetsAfterStableAlivePeriod(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	backend := fixture.backend(0)
+	fixture.clock.Advance(10 * time.Second)
+	fixture.pool.CheckOnce()
+	fixture.pool.CheckOnce()
+	fixture.clock.Advance(5 * time.Minute)
+	if status := backend.status(); status.State != "alive" || status.QuarantineLevel != 0 {
+		t.Fatalf("stable backend did not reset level: %#v", status)
+	}
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	status := backend.status()
+	if status.State != "quarantined" || status.QuarantineLevel != 1 || status.QuarantinedUntil.Sub(fixture.clock.Now()) != 10*time.Second {
+		t.Fatalf("next quarantine did not return to base: %#v", status)
+	}
+}
+
+func TestTransitionsOutsideWindowDoNotQuarantine(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.clock.Advance(time.Minute + time.Second)
+	fixture.flapCycle(0)
+	status := fixture.backend(0).status()
+	if status.State != "alive" || status.RecentTransitions != 2 {
+		t.Fatalf("old transitions counted outside window: %#v", status)
+	}
+}
+
+func TestQuarantineCapacitySafety(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	if status := fixture.backend(0).status(); status.State != "quarantined" {
+		t.Fatalf("first backend was not quarantined: %#v", status)
+	}
+	fixture.flapCycle(1)
+	fixture.flapCycle(1)
+	if status := fixture.backend(1).status(); status.State != "alive" {
+		t.Fatalf("safety limit should leave the second backend alive: %#v", status)
+	}
+	if status := fixture.backend(0).status(); status.State != "quarantined" {
+		t.Fatalf("first backend left quarantine unexpectedly: %#v", status)
+	}
+
+	single := newFlapFixture(t, 1, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	single.flapCycle(0)
+	single.flapCycle(0)
+	if status := single.backend(0).status(); status.State != "alive" {
+		t.Fatalf("single backend was quarantined and removed all capacity: %#v", status)
+	}
+}
+
+func TestCapacityLimitDoesNotBlockRealFailureEjection(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	fixture.healthy[1].Store(false)
+	for range 3 {
+		fixture.pool.CheckOnce()
+	}
+	status := fixture.backend(1).status()
+	if status.State != "dead" || status.QuarantineLevel != 0 {
+		t.Fatalf("genuinely failing backend was not normally ejected: %#v", status)
+	}
+}
+
+func TestQuarantineTransitionLogsOnlyOnce(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 10*time.Second, time.Minute, 5*time.Minute, 50)
+	var output bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+	fixture.flapCycle(0)
+	fixture.flapCycle(0)
+	if got := strings.Count(output.String(), "quarantined for 10s (level 1, 4 transitions in 1m0s)"); got != 1 {
+		t.Fatalf("quarantine log count = %d; output %q", got, output.String())
+	}
+	fixture.pool.CheckOnce()
+	if got := strings.Count(output.String(), "quarantined for"); got != 1 {
+		t.Fatalf("health check emitted repeated quarantine log: %q", output.String())
+	}
+	fixture.clock.Advance(10 * time.Second)
+	fixture.pool.CheckOnce()
+	if got := strings.Count(output.String(), "released from quarantine"); got != 1 {
+		t.Fatalf("release log count = %d; output %q", got, output.String())
+	}
+}
+
+func TestFlapRegistryRace(t *testing.T) {
+	fixture := newFlapFixture(t, 2, 4, 2*time.Second, 10*time.Second, 20*time.Second, 50)
+	thirdHealthy := &atomic.Bool{}
+	thirdHealthy.Store(true)
+	third := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !thirdHealthy.Load() {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "third")
+	}))
+	t.Cleanup(third.Close)
+	var unexpected atomic.Int32
+	var workers sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for requestIndex := 0; requestIndex < 20; requestIndex++ {
+				recorder := httptest.NewRecorder()
+				fixture.pool.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+				if recorder.Code != http.StatusOK && recorder.Code != http.StatusBadGateway && recorder.Code != http.StatusServiceUnavailable {
+					unexpected.Add(1)
+				}
+			}
+		}()
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for index := 0; index < 60; index++ {
+			fixture.healthy[0].Store(index%2 != 0)
+			fixture.pool.CheckOnce()
+			fixture.clock.Advance(time.Second)
+			_ = fixture.registry.List()
+		}
+	}()
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for index := 0; index < 60; index++ {
+			_ = fixture.registry.Remove(third.URL)
+			_, _ = fixture.registry.Add(third.URL)
+			_ = fixture.registry.List()
+		}
+	}()
+	workers.Wait()
+	if got := unexpected.Load(); got != 0 {
+		t.Fatalf("got %d unexpected status codes", got)
 	}
 }
