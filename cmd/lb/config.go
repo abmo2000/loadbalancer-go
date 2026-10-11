@@ -25,6 +25,7 @@ var defaultBackends = []string{
 type Config struct {
 	ListenAddr           string
 	Backends             []string
+	BackendHealth        map[string]BackendHealth
 	HealthInterval       time.Duration
 	HealthTimeout        time.Duration
 	FailThreshold        int
@@ -46,10 +47,17 @@ type Config struct {
 	CheckOnly            bool
 }
 
+type BackendHealth struct {
+	Path     string
+	Interval time.Duration
+	Timeout  time.Duration
+}
+
 func DefaultConfig() Config {
 	return Config{
 		ListenAddr:           ":8080",
 		Backends:             append([]string(nil), defaultBackends...),
+		BackendHealth:        make(map[string]BackendHealth),
 		HealthInterval:       5 * time.Second,
 		HealthTimeout:        2 * time.Second,
 		FailThreshold:        3,
@@ -69,6 +77,20 @@ func DefaultConfig() Config {
 		IdleTimeout:          60 * time.Second,
 		ShutdownTimeout:      15 * time.Second,
 	}
+}
+
+func (c Config) EffectiveBackendHealth(normalizedURL string) BackendHealth {
+	override := c.BackendHealth[normalizedURL]
+	if override.Path == "" {
+		override.Path = c.HealthPath
+	}
+	if override.Interval == 0 {
+		override.Interval = c.HealthInterval
+	}
+	if override.Timeout == 0 {
+		override.Timeout = c.HealthTimeout
+	}
+	return override
 }
 
 func parseBackends(value string) []string {
@@ -101,8 +123,9 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	if v, ok := lookupEnvValue(getenv, "LB_LISTEN_ADDR"); ok {
 		cfg.ListenAddr = v
 	}
+	backendsValue := strings.Join(cfg.Backends, ",")
 	if v, ok := lookupEnvValue(getenv, "LB_BACKENDS"); ok {
-		cfg.Backends = parseBackends(v)
+		backendsValue = v
 	}
 	durationSettings := []struct {
 		name   string
@@ -183,9 +206,8 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	var flagOutput bytes.Buffer
 	fs.SetOutput(&flagOutput)
 	listenAddr := cfg.ListenAddr
-	backendsValue := strings.Join(cfg.Backends, ",")
 	fs.StringVar(&listenAddr, "listen", cfg.ListenAddr, "listen address")
-	fs.StringVar(&backendsValue, "backends", strings.Join(cfg.Backends, ","), "comma-separated backend URLs")
+	fs.StringVar(&backendsValue, "backends", backendsValue, "comma-separated backend URLs")
 	fs.DurationVar(&cfg.HealthInterval, "health-interval", cfg.HealthInterval, "health check interval")
 	fs.DurationVar(&cfg.HealthTimeout, "health-timeout", cfg.HealthTimeout, "health check HTTP client timeout")
 	fs.IntVar(&cfg.FailThreshold, "health-fail-threshold", cfg.FailThreshold, "consecutive failures before marking a backend dead")
@@ -220,8 +242,75 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	}
 
 	cfg.ListenAddr = listenAddr
-	cfg.Backends = parseBackends(backendsValue)
+	var backendParseProblems []error
+	cfg.Backends, cfg.BackendHealth, backendParseProblems = parseBackendSpecs(backendsValue)
+	parseProblems = append(parseProblems, backendParseProblems...)
 	return cfg, errors.Join(parseProblems...)
+}
+
+func parseBackendSpecs(value string) ([]string, map[string]BackendHealth, []error) {
+	backends := make([]string, 0)
+	health := make(map[string]BackendHealth)
+	var problems []error
+	allowed := "health_path, health_interval, health_timeout"
+
+	for _, untrimmed := range strings.Split(value, ",") {
+		entry := strings.TrimSpace(untrimmed)
+		if entry == "" {
+			continue
+		}
+		parts := strings.Split(entry, ";")
+		rawURL := strings.TrimSpace(parts[0])
+		options := BackendHealth{}
+		keys := make(map[string]struct{})
+		for _, rawOption := range parts[1:] {
+			option := strings.TrimSpace(rawOption)
+			if option == "" {
+				continue
+			}
+			keyValue := strings.SplitN(option, "=", 2)
+			key := strings.ToLower(strings.TrimSpace(keyValue[0]))
+			if key == "" || len(keyValue) != 2 || strings.TrimSpace(keyValue[1]) == "" {
+				problems = append(problems, fmt.Errorf("LB_BACKENDS: %q has an empty option value; expected key=value (%s)", entry, allowed))
+				continue
+			}
+			if _, exists := keys[key]; exists {
+				problems = append(problems, fmt.Errorf("LB_BACKENDS: %q repeats option %q; each option key may appear once", entry, key))
+				continue
+			}
+			keys[key] = struct{}{}
+			optionValue := strings.TrimSpace(keyValue[1])
+			switch key {
+			case "health_path":
+				options.Path = optionValue
+			case "health_interval", "health_timeout":
+				duration, err := time.ParseDuration(optionValue)
+				if err != nil {
+					problems = append(problems, fmt.Errorf("LB_BACKENDS: %q has an invalid %s (use e.g. 2s, 500ms)", entry, key))
+					continue
+				}
+				if key == "health_interval" {
+					options.Interval = duration
+				} else {
+					options.Timeout = duration
+				}
+			default:
+				problems = append(problems, fmt.Errorf("LB_BACKENDS: %q has unknown option %q; allowed options are %s", entry, key, allowed))
+			}
+		}
+
+		normalized, _, err := normalizeBackendURL(rawURL)
+		if err != nil {
+			problems = append(problems, err)
+			backends = append(backends, rawURL)
+			continue
+		}
+		backends = append(backends, normalized)
+		if options != (BackendHealth{}) {
+			health[normalized] = options
+		}
+	}
+	return backends, health, problems
 }
 
 const maxConfigDuration = 24 * time.Hour
@@ -265,9 +354,10 @@ func (c *Config) Validate() error {
 		if c.QuarantineBase > c.QuarantineMax {
 			problems = append(problems, fmt.Errorf("LB_QUARANTINE_BASE: %q must be less than or equal to LB_QUARANTINE_MAX %q", c.QuarantineBase, c.QuarantineMax))
 		}
-		minimumWindow := c.HealthInterval * time.Duration(c.FailThreshold+c.RiseThreshold)
+		largestInterval, largestBackend := c.largestEffectiveInterval()
+		minimumWindow := largestInterval * time.Duration(c.FailThreshold+c.RiseThreshold)
 		if minimumWindow > 0 && c.FlapWindow < minimumWindow {
-			problems = append(problems, fmt.Errorf("LB_FLAP_WINDOW: %q must be at least LB_HEALTH_INTERVAL * (LB_HEALTH_FAIL_THRESHOLD + LB_HEALTH_RISE_THRESHOLD) = %s", c.FlapWindow, minimumWindow))
+			problems = append(problems, fmt.Errorf("LB_FLAP_WINDOW: %q must be at least the largest effective health_interval %q for backend %q times (LB_HEALTH_FAIL_THRESHOLD + LB_HEALTH_RISE_THRESHOLD) = %s", c.FlapWindow, largestInterval, largestBackend, minimumWindow))
 		}
 	}
 
@@ -283,6 +373,21 @@ func (c *Config) Validate() error {
 		}
 
 		c.Backends[index] = normalized
+		effective := c.EffectiveBackendHealth(normalized)
+		if !validHealthPath(effective.Path) {
+			problems = append(problems, fmt.Errorf("LB_BACKENDS: backend %q health_path (LB_HEALTH_PATH) %q must start with /, contain no spaces, ? or #, and be at most 200 characters", normalized, effective.Path))
+		}
+		if effective.Interval <= 0 || effective.Interval > maxConfigDuration {
+			problems = append(problems, fmt.Errorf("LB_BACKENDS: backend %q health_interval (LB_HEALTH_INTERVAL) %q must be greater than 0 and no more than 24h", normalized, effective.Interval))
+		} else if override := c.BackendHealth[normalized]; override.Interval != 0 && override.Interval < 100*time.Millisecond {
+			problems = append(problems, fmt.Errorf("LB_BACKENDS: backend %q health_interval %q is below the minimum 100ms", normalized, override.Interval))
+		}
+		if effective.Timeout <= 0 || effective.Timeout > maxConfigDuration {
+			problems = append(problems, fmt.Errorf("LB_BACKENDS: backend %q health_timeout (LB_HEALTH_TIMEOUT) %q must be greater than 0 and no more than 24h", normalized, effective.Timeout))
+		}
+		if effective.Interval > 0 && effective.Timeout >= effective.Interval {
+			problems = append(problems, fmt.Errorf("LB_BACKENDS: backend %q health_timeout (LB_HEALTH_TIMEOUT) %q must be strictly less than health_interval (LB_HEALTH_INTERVAL) %q", normalized, effective.Timeout, effective.Interval))
+		}
 		if previous, ok := seen[normalized]; ok {
 			problems = append(problems, fmt.Errorf("LB_BACKENDS: %q duplicates %q after URL normalization; each backend must be unique", raw, previous))
 		} else {
@@ -315,9 +420,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if durationValid["LB_HEALTH_INTERVAL"] && durationValid["LB_HEALTH_TIMEOUT"] && c.HealthTimeout >= c.HealthInterval {
-		problems = append(problems, fmt.Errorf("LB_HEALTH_TIMEOUT: %q must be less than LB_HEALTH_INTERVAL %q to avoid overlapping checks", c.HealthTimeout, c.HealthInterval))
-	}
 	if durationValid["LB_DIAL_TIMEOUT"] && durationValid["LB_RESPONSE_TIMEOUT"] && c.DialTimeout > c.ResponseTimeout {
 		problems = append(problems, fmt.Errorf("LB_DIAL_TIMEOUT: %q must be less than or equal to LB_RESPONSE_TIMEOUT %q", c.DialTimeout, c.ResponseTimeout))
 	}
@@ -326,6 +428,27 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(problems...)
+}
+
+func validHealthPath(path string) bool {
+	return strings.HasPrefix(path, "/") && !strings.ContainsAny(path, " \t\r\n?#") && utf8.RuneCountInString(path) <= 200
+}
+
+func (c Config) largestEffectiveInterval() (time.Duration, string) {
+	largest := time.Duration(0)
+	backendURL := ""
+	for _, rawURL := range c.Backends {
+		normalized, _, err := normalizeBackendURL(rawURL)
+		if err != nil {
+			continue
+		}
+		effective := c.EffectiveBackendHealth(normalized)
+		if effective.Interval > largest {
+			largest = effective.Interval
+			backendURL = normalized
+		}
+	}
+	return largest, backendURL
 }
 
 func normalizeBackendURL(raw string) (string, *url.URL, error) {
@@ -463,14 +586,21 @@ func (c Config) Warnings() []string {
 	if c.ShutdownTimeout > 0 && c.ResponseTimeout > 0 && c.ShutdownTimeout < c.ResponseTimeout {
 		warnings = append(warnings, fmt.Sprintf("LB_SHUTDOWN_TIMEOUT %q is shorter than LB_RESPONSE_TIMEOUT %q; in-flight requests may be cut off during shutdown", c.ShutdownTimeout, c.ResponseTimeout))
 	}
-	if c.HealthInterval > 0 && c.FailThreshold > 0 {
-		detectionTime := c.HealthInterval * time.Duration(c.FailThreshold)
-		if detectionTime > c.ResponseTimeout*3 || detectionTime > 60*time.Second {
-			warnings = append(warnings, fmt.Sprintf("LB_HEALTH_INTERVAL %q times LB_HEALTH_FAIL_THRESHOLD %d means dead backends may take %s to detect", c.HealthInterval, c.FailThreshold, detectionTime))
+	for _, backendURL := range c.Backends {
+		normalized, _, err := normalizeBackendURL(backendURL)
+		if err != nil {
+			normalized = backendURL
 		}
-	}
-	if c.FlapMaxTransitions != 0 && c.HealthInterval > 0 && c.RiseThreshold > 0 && c.QuarantineBase < c.HealthInterval*time.Duration(c.RiseThreshold) {
-		warnings = append(warnings, fmt.Sprintf("LB_QUARANTINE_BASE %q is shorter than LB_HEALTH_INTERVAL * LB_HEALTH_RISE_THRESHOLD (%s); the hold-down may end before normal recovery is possible", c.QuarantineBase, c.HealthInterval*time.Duration(c.RiseThreshold)))
+		effective := c.EffectiveBackendHealth(normalized)
+		if effective.Interval > 0 && c.FailThreshold > 0 {
+			detectionTime := effective.Interval * time.Duration(c.FailThreshold)
+			if detectionTime > c.ResponseTimeout*3 || detectionTime > 60*time.Second {
+				warnings = append(warnings, fmt.Sprintf("backend %q: effective health_interval %q times LB_HEALTH_FAIL_THRESHOLD %d means dead backends may take %s to detect", normalized, effective.Interval, c.FailThreshold, detectionTime))
+			}
+		}
+		if c.FlapMaxTransitions != 0 && effective.Interval > 0 && c.RiseThreshold > 0 && c.QuarantineBase < effective.Interval*time.Duration(c.RiseThreshold) {
+			warnings = append(warnings, fmt.Sprintf("backend %q: LB_QUARANTINE_BASE %q is shorter than effective health_interval * LB_HEALTH_RISE_THRESHOLD (%s); the hold-down may end before normal recovery is possible", normalized, c.QuarantineBase, effective.Interval*time.Duration(c.RiseThreshold)))
+		}
 	}
 	return warnings
 }
@@ -484,10 +614,30 @@ func Preflight(c Config) error {
 }
 
 func (c Config) String() string {
+	backends := make([]string, 0, len(c.Backends))
+	for _, backendURL := range c.Backends {
+		entry := backendURL
+		if health, exists := c.BackendHealth[backendURL]; exists {
+			options := make([]string, 0, 3)
+			if health.Path != "" {
+				options = append(options, "path="+health.Path)
+			}
+			if health.Interval != 0 {
+				options = append(options, "interval="+health.Interval.String())
+			}
+			if health.Timeout != 0 {
+				options = append(options, "timeout="+health.Timeout.String())
+			}
+			if len(options) > 0 {
+				entry += "(" + strings.Join(options, " ") + ")"
+			}
+		}
+		backends = append(backends, entry)
+	}
 	return fmt.Sprintf(
 		"listen=%s backends=%v healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s flapWindow=%s flapMaxTransitions=%d quarantineBase=%s quarantineMax=%s quarantineResetAfter=%s maxQuarantinePercent=%d dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
 		c.ListenAddr,
-		c.Backends,
+		backends,
 		c.HealthInterval,
 		c.HealthTimeout,
 		c.FailThreshold,

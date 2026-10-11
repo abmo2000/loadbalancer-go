@@ -282,6 +282,48 @@ The registry tests cover these guarantees:
 - `TestRegistryRaceConcurrentChanges`: exercises concurrent requests, add/remove, status listing, and health checks.
 - `TestPoolEmptyRegistry`: confirms an empty registry selects no backend and responds with 503.
 
+## Per-backend health configuration (Phase 1)
+
+Each `LB_BACKENDS` or `-backends` entry may override probe settings after its URL. Entries remain comma-separated; whitespace around entries and option parts is trimmed, empty entries and option parts are ignored, and option names are case-insensitive.
+
+```text
+http://localhost:9001
+http://localhost:9001;health_path=/healthz
+http://localhost:9001;health_path=/healthz;health_interval=2s;health_timeout=500ms
+```
+
+| Option | Inherited default | Rules |
+| --- | --- | --- |
+| `health_path` | `LB_HEALTH_PATH` (`/`) | Starts with `/`; no spaces, `?`, or `#`; at most 200 characters |
+| `health_interval` | `LB_HEALTH_INTERVAL` (`5s`) | Greater than zero and at most `24h`; per-backend override is at least `100ms` |
+| `health_timeout` | `LB_HEALTH_TIMEOUT` (`2s`) | Greater than zero and at most `24h`; strictly less than the backend's effective interval |
+
+Per-backend values override the corresponding global setting; omitted options inherit it. URLs are normalized before storage and duplicate detection, and options do not make duplicate URLs distinct. Unknown or repeated keys, empty values, malformed durations, and invalid effective values are reported with other config errors; invalid configuration exits with status `2`.
+
+The scheduler computes the earliest `NextCheckAt`, waits on a timer capped at one second so runtime additions are noticed, then probes only due backends in parallel. Each next deadline is based on that probe's start time plus its effective interval. A slow probe therefore does not stretch its period or delay other backends. `CheckOnce()` remains an immediate all-backend probe regardless of deadlines.
+
+Detection time is per backend: approximately `effective interval * FailThreshold`, plus up to one interval depending on when failure begins. With `FailThreshold=3`, a `1s` backend takes about `3s` to detect failure, while a `10s` backend takes about `30s`. Flap-window validation uses the largest effective backend interval. Long-detection warnings name the affected backend.
+
+`BackendStatus` reports effective `HealthPath`, `HealthInterval`, `HealthTimeout`, and `NextCheckAt`; startup logging appends explicitly configured overrides to each normalized backend URL.
+
+Fail/rise thresholds and flap-protection settings remain global. Per-backend values are in memory, are not hot-reloaded, and have no jitter; there are no per-backend threshold overrides.
+
+Per-backend health tests cover the following:
+
+- `TestBackendHealthSpecParsing`: parses plain, complete, partial, whitespace, case-insensitive, trailing-separator, and empty-entry specs.
+- `TestBackendHealthSpecErrors`: rejects unknown/repeated keys, empty values, malformed/negative durations, and invalid paths.
+- `TestBackendHealthEffectiveValuesAndNormalizedDuplicates`: checks override precedence, inheritance, and option-independent URL duplicates.
+- `TestBackendHealthEffectiveValidationAndLargestFlapInterval`: verifies strict timeout ordering, the minimum override interval, and the slowest-backend flap-window rule.
+- `TestBackendHealthWarningsArePerBackend`: checks that long detection and short hold warnings identify their backend.
+- `TestPerBackendHealthPaths`: verifies each backend receives only its configured probe path.
+- `TestPerBackendHealthTimeouts`: verifies a short probe deadline fails while another backend's longer deadline succeeds.
+- `TestCheckDueUsesPerBackendIntervals`: checks exact 1s and 5s probe counts under a fake clock.
+- `TestCheckDueDynamicAddRemoveAndCheckOnceAll`: checks immediate scheduling for additions, no later probes after removal, and all-backend `CheckOnce` behavior.
+- `TestCheckDueNonOverlapAcrossIntervals`: checks overlapping due probes are skipped and rescheduled.
+- `TestPerBackendStatusShowsEffectiveSchedule`: verifies status contains effective values and `NextCheckAt`.
+- `TestPerBackendSchedulerCancellation`: verifies an in-flight scheduled probe aborts on cancellation.
+- `TestPerBackendSchedulerRegistryRace`: races scheduled checks, traffic, status snapshots, and option-bearing registry updates.
+
 ## Health checks (Phase 1)
 
 Health checks use explicit failure and recovery thresholds. Ordinary probe failures do not immediately remove a backend, and successful client traffic never probes a backend that is already dead.
@@ -325,9 +367,9 @@ An alive backend increments its failure streak on each active failure and is mar
 
 Detection takes roughly `HealthInterval * FailThreshold`; recovery takes roughly `HealthInterval * RiseThreshold`, plus up to one interval depending on where a failure or recovery begins relative to the next tick. With defaults, detection is about `5s * 3 = 15s`, and recovery is about `5s * 2 = 10s`.
 
-Each round checks backends in parallel so one slow target does not add its timeout to every later target. An atomic per-backend guard skips an overlapping probe instead of allowing rounds to pile up; a backend emits at most one skip log while its current check is running. Each backend has a separate health transport with one idle connection per host, so probes do not share proxy traffic connections. Probe requests derive their timeout context from the health-loop context, drain at most 4 KB, and do not follow redirects.
+Each round checks backends in parallel so one slow target does not add its timeout to every later target. An atomic per-backend guard skips an overlapping probe instead of allowing rounds to pile up; a backend emits at most one skip log while its current check is running. All probes share a dedicated health transport with one idle connection per host, separate from proxy traffic. Probe requests derive their timeout context from the health-loop context, drain at most 4 KB, and do not follow redirects.
 
-Known limits: checks have no jitter, thresholds and paths cannot be overridden per backend, and all health state is in memory and resets on restart.
+Known limits: checks have no jitter, thresholds are global, and all health state is in memory and resets on restart.
 
 Health-check tests cover these behaviors:
 
@@ -380,9 +422,11 @@ The capacity limit is `floor(total * MaxQuarantinePercent / 100)`, and at least 
 
 The clock is injected through Registry and Backend so tests can advance transition windows, hold-down deadlines, and level resets deterministically without sleeping.
 
-Known limits: no per-backend overrides are available; transition history and quarantine level are in memory and reset on restart.
+Known limits: thresholds and flap settings have no per-backend overrides; transition history and quarantine level are in memory and reset on restart.
 
 `cmd/backend -flaky-period 4s` is a testing aid: it alternates successful and `503` responses on `/` in four-second periods measured from process start. The `/slow` endpoint is unchanged; leave this flag at its default `0` outside tests.
+
+`cmd/backend -log-requests` is another testing aid. It logs each request as a timestamp, method, and path so probe paths and scheduling intervals can be inspected; the default is off.
 
 Flap-protection tests cover these behaviors:
 
@@ -402,7 +446,7 @@ Flap-protection tests cover these behaviors:
 ## Design notes
 
 - Passive hard dial failures mark a backend dead immediately; all other failures follow the configured consecutive-failure threshold.
-- Thresholds are consecutive counts, not a rolling time window, and there is no jitter or per-backend override yet.
+- Thresholds are consecutive counts, not a rolling time window, and there is no jitter or per-backend threshold override yet.
 
 ## Project layout
 

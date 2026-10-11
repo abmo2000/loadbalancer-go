@@ -11,10 +11,15 @@ import (
 func main() {
 	port := flag.String("port", "9001", "port to listen on")
 	flakyPeriod := flag.Duration("flaky-period", 0, "testing aid: alternate healthy and 503 root periods")
+	logRequests := flag.Bool("log-requests", false, "testing aid: log request timestamp, method, and path")
 	flag.Parse()
 	startedAt := time.Now()
+	if *logRequests {
+		log.SetFlags(0)
+	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" && *flakyPeriod > 0 && int64(time.Since(startedAt) / *flakyPeriod)%2 == 1 {
 			http.Error(w, "temporarily unhealthy", http.StatusServiceUnavailable)
 			return
@@ -22,11 +27,18 @@ func main() {
 		fmt.Fprintf(w, "Hello from backend on port %s\n", *port)
 	})
 
-	http.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(15 * time.Second)
 		fmt.Fprintf(w, "finally done (port %s)\n", *port)
 	})
 
 	log.Println("backend listening on :" + *port)
-	log.Fatal(http.ListenAndServe(":"+*port, nil))
+	handler := http.Handler(mux)
+	if *logRequests {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("%s %s %s", time.Now().Format(time.RFC3339Nano), r.Method, r.URL.Path)
+			mux.ServeHTTP(w, r)
+		})
+	}
+	log.Fatal(http.ListenAndServe(":"+*port, handler))
 }

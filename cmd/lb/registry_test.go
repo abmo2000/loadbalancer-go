@@ -1076,3 +1076,293 @@ func TestFlapRegistryRace(t *testing.T) {
 		t.Fatalf("got %d unexpected status codes", got)
 	}
 }
+
+func TestPerBackendHealthPaths(t *testing.T) {
+	paths := []chan string{make(chan string, 2), make(chan string, 2)}
+	servers := make([]*httptest.Server, 2)
+	for index := range servers {
+		index := index
+		servers[index] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths[index] <- r.URL.Path
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(servers[index].Close)
+	}
+	registry := NewRegistry(time.Second, time.Second)
+	registry.ConfigureHealthDefaults(BackendHealth{Path: "/", Interval: 5 * time.Second, Timeout: time.Second})
+	for index, path := range []string{"/healthz", "/ping"} {
+		if _, err := registry.AddWithOptions(servers[index].URL, BackendHealth{Path: path}); err != nil {
+			t.Fatalf("AddWithOptions returned error: %v", err)
+		}
+	}
+	pool := &Pool{registry: registry}
+	pool.CheckOnce()
+	for index, want := range []string{"/healthz", "/ping"} {
+		if got := waitRegistryResult(t, paths[index], "backend probe path"); got != want {
+			t.Fatalf("backend %d path = %q; want %q", index, got, want)
+		}
+	}
+}
+
+func TestPerBackendHealthTimeouts(t *testing.T) {
+	var received [2]atomic.Int32
+	servers := make([]*httptest.Server, 2)
+	for index := range servers {
+		index := index
+		servers[index] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			received[index].Add(1)
+			timer := time.NewTimer(400 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-request.Context().Done():
+			case <-timer.C:
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		t.Cleanup(servers[index].Close)
+	}
+	registry := NewRegistry(time.Second, time.Second)
+	registry.ConfigureHealthDefaults(BackendHealth{Path: "/", Interval: 3 * time.Second, Timeout: 2 * time.Second})
+	if _, err := registry.AddWithOptions(servers[0].URL, BackendHealth{Interval: time.Second, Timeout: 200 * time.Millisecond}); err != nil {
+		t.Fatalf("Add short-timeout backend: %v", err)
+	}
+	if _, err := registry.Add(servers[1].URL); err != nil {
+		t.Fatalf("Add inherited-timeout backend: %v", err)
+	}
+	pool := &Pool{registry: registry}
+	started := time.Now()
+	pool.CheckOnce()
+	if time.Since(started) > time.Second {
+		t.Fatal("parallel health checks exceeded one second")
+	}
+	statuses := registry.List()
+	if statuses[0].LastFailureKind != "timeout" || !statuses[1].Alive || statuses[1].LastFailureKind != "" {
+		t.Fatalf("per-backend timeout results = %#v", statuses)
+	}
+}
+
+func TestCheckDueUsesPerBackendIntervals(t *testing.T) {
+	clock := newFlapFakeClock()
+	var hits [2]atomic.Int32
+	servers := make([]*httptest.Server, 2)
+	for index := range servers {
+		index := index
+		servers[index] = newRegistryTestServer(t, "ok", func() { hits[index].Add(1) })
+	}
+	registry := NewRegistry(time.Second, time.Second)
+	registry.now = clock.Now
+	registry.ConfigureHealthDefaults(BackendHealth{Path: "/", Interval: 5 * time.Second, Timeout: time.Second})
+	if _, err := registry.AddWithOptions(servers[0].URL, BackendHealth{Interval: time.Second, Timeout: 500 * time.Millisecond}); err != nil {
+		t.Fatalf("Add 1s backend: %v", err)
+	}
+	if _, err := registry.Add(servers[1].URL); err != nil {
+		t.Fatalf("Add 5s backend: %v", err)
+	}
+	pool := &Pool{registry: registry}
+	pool.CheckDue(context.Background())
+	for step := 1; step <= 4; step++ {
+		clock.Advance(time.Second)
+		pool.CheckDue(context.Background())
+		if got := hits[0].Load(); got != int32(step+1) {
+			t.Fatalf("1s backend hits at t=%ds = %d; want %d", step, got, step+1)
+		}
+		if got := hits[1].Load(); got != 1 {
+			t.Fatalf("5s backend hits at t=%ds = %d; want 1", step, got)
+		}
+	}
+	clock.Advance(time.Second)
+	pool.CheckDue(context.Background())
+	if hits[0].Load() != 6 || hits[1].Load() != 2 {
+		t.Fatalf("hits at t=5s = (%d, %d); want (6, 2)", hits[0].Load(), hits[1].Load())
+	}
+}
+
+func TestCheckDueDynamicAddRemoveAndCheckOnceAll(t *testing.T) {
+	clock := newFlapFakeClock()
+	var hits [2]atomic.Int32
+	servers := make([]*httptest.Server, 2)
+	for index := range servers {
+		index := index
+		servers[index] = newRegistryTestServer(t, "ok", func() { hits[index].Add(1) })
+	}
+	registry := NewRegistry(time.Second, time.Second)
+	registry.now = clock.Now
+	registry.ConfigureHealthDefaults(BackendHealth{Path: "/", Interval: 10 * time.Second, Timeout: time.Second})
+	_, err := registry.Add(servers[0].URL)
+	if err != nil {
+		t.Fatalf("Add initial backend: %v", err)
+	}
+	pool := &Pool{registry: registry}
+	pool.CheckDue(context.Background())
+	if _, err := registry.AddWithOptions(servers[1].URL, BackendHealth{Path: "/custom", Interval: time.Second, Timeout: 500 * time.Millisecond}); err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	pool.CheckDue(context.Background())
+	if hits[1].Load() != 1 {
+		t.Fatalf("new backend was not due immediately: hits=%d", hits[1].Load())
+	}
+	if err := registry.Remove(servers[0].URL); err != nil {
+		t.Fatalf("Remove initial backend: %v", err)
+	}
+	clock.Advance(10 * time.Second)
+	pool.CheckDue(context.Background())
+	if hits[0].Load() != 1 {
+		t.Fatalf("removed backend was probed again: hits=%d", hits[0].Load())
+	}
+	if hits[1].Load() != 2 {
+		t.Fatalf("remaining backend not probed when due: hits=%d", hits[1].Load())
+	}
+
+	if err := registry.SetHealthOverride(servers[1].URL, BackendHealth{Interval: time.Hour}); err != nil {
+		t.Fatalf("SetHealthOverride: %v", err)
+	}
+	pool.CheckDue(context.Background())
+	before := hits[1].Load()
+	pool.CheckOnce()
+	if hits[1].Load() != before+1 {
+		t.Fatalf("CheckOnce did not probe a not-yet-due backend: before=%d after=%d", before, hits[1].Load())
+	}
+	if _, exists := registry.Get(servers[0].URL); exists {
+		t.Fatal("removed backend is still present in the registry")
+	}
+}
+
+func TestCheckDueNonOverlapAcrossIntervals(t *testing.T) {
+	clock := newFlapFakeClock()
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBackend := func() { releaseOnce.Do(func() { close(release) }) }
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		hits.Add(1)
+		entered <- struct{}{}
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusOK)
+		case <-request.Context().Done():
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(releaseBackend)
+	registry := NewRegistry(time.Second, time.Second)
+	registry.now = clock.Now
+	registry.ConfigureHealthDefaults(BackendHealth{Path: "/", Interval: time.Second, Timeout: 500 * time.Millisecond})
+	if _, err := registry.Add(server.URL); err != nil {
+		t.Fatalf("Add backend: %v", err)
+	}
+	pool := &Pool{registry: registry}
+	firstDone := make(chan struct{})
+	go func() {
+		pool.CheckDue(context.Background())
+		close(firstDone)
+	}()
+	waitRegistrySignal(t, entered, "first scheduled health probe")
+	clock.Advance(time.Second)
+	pool.CheckDue(context.Background())
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("overlapping due round entered handler %d times; want 1", got)
+	}
+	status := registry.List()[0]
+	if !status.NextCheckAt.Equal(clock.Now().Add(time.Second)) {
+		t.Fatalf("overlap skip NextCheckAt=%s; want %s", status.NextCheckAt, clock.Now().Add(time.Second))
+	}
+	releaseBackend()
+	waitRegistrySignal(t, firstDone, "initial health probe")
+	clock.Advance(time.Second)
+	pool.CheckDue(context.Background())
+	if hits.Load() != 2 {
+		t.Fatalf("next due round hit count = %d; want 2", hits.Load())
+	}
+}
+
+func TestPerBackendStatusShowsEffectiveSchedule(t *testing.T) {
+	clock := newFlapFakeClock()
+	server := newRegistryTestServer(t, "ok", nil)
+	registry := NewRegistry(time.Second, time.Second)
+	registry.now = clock.Now
+	registry.ConfigureHealthDefaults(BackendHealth{Path: "/", Interval: 5 * time.Second, Timeout: time.Second})
+	if _, err := registry.AddWithOptions(server.URL, BackendHealth{Path: "/probe", Interval: 2 * time.Second, Timeout: 500 * time.Millisecond}); err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	status := registry.List()[0]
+	if status.HealthPath != "/probe" || status.HealthInterval != "2s" || status.HealthTimeout != "500ms" || !status.NextCheckAt.Equal(clock.Now()) {
+		t.Fatalf("backend schedule status = %#v", status)
+	}
+}
+
+func TestPerBackendSchedulerCancellation(t *testing.T) {
+	entered := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(entered)
+		<-request.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	registry := NewRegistry(time.Second, time.Second)
+	if _, err := registry.AddWithOptions(server.URL, BackendHealth{Interval: time.Second, Timeout: 10 * time.Second}); err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	pool := &Pool{registry: registry}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pool.HealthCheckContext(ctx, 5*time.Second)
+		close(done)
+	}()
+	waitRegistrySignal(t, entered, "scheduled probe")
+	cancel()
+	waitRegistrySignal(t, done, "scheduler cancellation")
+}
+
+func TestPerBackendSchedulerRegistryRace(t *testing.T) {
+	servers := []*httptest.Server{
+		newRegistryTestServer(t, "one", nil),
+		newRegistryTestServer(t, "two", nil),
+		newRegistryTestServer(t, "three", nil),
+	}
+	registry := NewRegistry(time.Second, time.Second)
+	defaults := BackendHealth{Path: "/", Interval: 100 * time.Millisecond, Timeout: 50 * time.Millisecond}
+	registry.ConfigureHealthDefaults(defaults)
+	for _, server := range servers[:2] {
+		if _, err := registry.Add(server.URL); err != nil {
+			t.Fatalf("Add initial backend: %v", err)
+		}
+	}
+	pool := &Pool{registry: registry}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pool.HealthCheckContext(ctx, 100*time.Millisecond)
+		close(done)
+	}()
+	var badStatus atomic.Int32
+	var workers sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for requestIndex := 0; requestIndex < 20; requestIndex++ {
+				recorder := httptest.NewRecorder()
+				pool.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+				if recorder.Code != http.StatusOK && recorder.Code != http.StatusBadGateway && recorder.Code != http.StatusServiceUnavailable {
+					badStatus.Add(1)
+				}
+			}
+		}()
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for index := 0; index < 40; index++ {
+			_ = registry.Remove(servers[2].URL)
+			_, _ = registry.AddWithOptions(servers[2].URL, BackendHealth{Path: "/check", Interval: 200 * time.Millisecond, Timeout: 50 * time.Millisecond})
+			_ = registry.List()
+		}
+	}()
+	workers.Wait()
+	cancel()
+	waitRegistrySignal(t, done, "scheduler exit")
+	if got := badStatus.Load(); got != 0 {
+		t.Fatalf("got %d unexpected response codes", got)
+	}
+}

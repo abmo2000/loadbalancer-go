@@ -3,6 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
+	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +34,10 @@ type BackendStatus struct {
 	QuarantinedUntil     time.Time `json:"quarantinedUntil"`
 	QuarantineLevel      int       `json:"quarantineLevel"`
 	RecentTransitions    int       `json:"recentTransitions"`
+	HealthPath           string    `json:"healthPath"`
+	HealthInterval       string    `json:"healthInterval"`
+	HealthTimeout        string    `json:"healthTimeout"`
+	NextCheckAt          time.Time `json:"nextCheckAt"`
 }
 
 type Registry struct {
@@ -48,9 +55,19 @@ type Registry struct {
 	quarantineResetAfter time.Duration
 	maxQuarantinePercent int
 	now                  func() time.Time
+	healthDefaults       BackendHealth
+	healthOverrides      map[string]BackendHealth
+	healthTransport      *http.Transport
+	healthClient         *http.Client
 }
 
 func NewRegistry(responseTimeout, dialTimeout time.Duration) *Registry {
+	healthTransport := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		IdleConnTimeout:     10 * time.Second,
+		DisableKeepAlives:   false,
+		MaxIdleConnsPerHost: 1,
+	}
 	registry := &Registry{
 		byURL:                make(map[string]*Backend),
 		responseTimeout:      responseTimeout,
@@ -64,6 +81,15 @@ func NewRegistry(responseTimeout, dialTimeout time.Duration) *Registry {
 		quarantineResetAfter: 5 * time.Minute,
 		maxQuarantinePercent: 50,
 		now:                  time.Now,
+		healthDefaults:       BackendHealth{Path: "/", Interval: 5 * time.Second, Timeout: 2 * time.Second},
+		healthOverrides:      make(map[string]BackendHealth),
+		healthTransport:      healthTransport,
+		healthClient: &http.Client{
+			Transport: healthTransport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 	empty := make([]*Backend, 0)
 	registry.backends.Store(&empty)
@@ -71,6 +97,10 @@ func NewRegistry(responseTimeout, dialTimeout time.Duration) *Registry {
 }
 
 func (r *Registry) Add(rawURL string) (*Backend, error) {
+	return r.AddWithOptions(rawURL, BackendHealth{})
+}
+
+func (r *Registry) AddWithOptions(rawURL string, health BackendHealth) (*Backend, error) {
 	normalized, parsed, err := normalizeBackendURL(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidBackend, err)
@@ -81,13 +111,21 @@ func (r *Registry) Add(rawURL string) (*Backend, error) {
 	if _, exists := r.byURL[normalized]; exists {
 		return nil, fmt.Errorf("%w: %s", ErrDuplicateBackend, normalized)
 	}
+	effective := resolveBackendHealth(r.healthDefaults, health)
 	backend := NewBackend(parsed, r.dialTimeout, r.responseTimeout)
+	backend.healthTransport = r.healthTransport
+	backend.healthClient = r.healthClient
 	backend.registry = r
 	backend.now = r.now
 	backendTime := r.now()
 	backend.addedAt = backendTime
 	backend.lastStateChange = backendTime
 	backend.lastAliveChange = backendTime
+	backend.healthPath = effective.Path
+	backend.healthInterval = effective.Interval
+	backend.healthTimeout = effective.Timeout
+	backend.nextCheckAt = backendTime
+	r.healthOverrides[normalized] = health
 	backend.configureFlap(r.flapWindow, r.flapMaxTransitions, r.quarantineBase, r.quarantineMax, r.quarantineResetAfter)
 	backend.configureHealth(r.failThreshold, r.riseThreshold)
 	backends := append(r.snapshot(), backend)
@@ -115,11 +153,129 @@ func (r *Registry) Remove(rawURL string) error {
 		}
 	}
 	delete(r.byURL, normalized)
+	delete(r.healthOverrides, normalized)
 	r.store(updated)
 	r.mu.Unlock()
 
 	backend.transport.CloseIdleConnections()
 	backend.healthTransport.CloseIdleConnections()
+	return nil
+}
+
+func resolveBackendHealth(defaults, override BackendHealth) BackendHealth {
+	if override.Path == "" {
+		override.Path = defaults.Path
+	}
+	if override.Interval == 0 {
+		override.Interval = defaults.Interval
+	}
+	if override.Timeout == 0 {
+		override.Timeout = defaults.Timeout
+	}
+	return override
+}
+
+func (r *Registry) ConfigureHealthDefaults(defaults BackendHealth) {
+	r.mu.Lock()
+	r.healthDefaults = defaults
+	now := r.now()
+	for normalized, backend := range r.byURL {
+		health := resolveBackendHealth(defaults, r.healthOverrides[normalized])
+		backend.mu.Lock()
+		backend.healthPath = health.Path
+		backend.healthInterval = health.Interval
+		backend.healthTimeout = health.Timeout
+		backend.nextCheckAt = now
+		backend.mu.Unlock()
+	}
+	r.mu.Unlock()
+}
+
+func (r *Registry) healthDefaultsSnapshot() BackendHealth {
+	r.mu.RLock()
+	defaults := r.healthDefaults
+	r.mu.RUnlock()
+	return defaults
+}
+
+func (r *Registry) reserveChecks(dueOnly bool) []backendCheck {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	backends := r.snapshot()
+	checks := make([]backendCheck, 0, len(backends))
+	for _, backend := range backends {
+		backend.mu.Lock()
+		started := r.now()
+		if dueOnly && backend.nextCheckAt.After(started) {
+			backend.mu.Unlock()
+			continue
+		}
+		if !backend.checking.CompareAndSwap(false, true) {
+			backend.nextCheckAt = started.Add(backend.healthInterval)
+			shouldLog := backend.skipLogged.CompareAndSwap(false, true)
+			backend.mu.Unlock()
+			if shouldLog {
+				log.Printf("health check for %s still running, skipping tick", backend.URL)
+			}
+			continue
+		}
+		backend.nextCheckAt = started.Add(backend.healthInterval)
+		backend.skipLogged.Store(false)
+		checks = append(checks, backendCheck{
+			backend: backend,
+			started: started,
+			path:    backend.healthPath,
+			timeout: backend.healthTimeout,
+		})
+		backend.mu.Unlock()
+	}
+	return checks
+}
+
+func (r *Registry) durationUntilNextCheck() time.Duration {
+	r.mu.RLock()
+	backends := r.snapshot()
+	if len(backends) == 0 {
+		r.mu.RUnlock()
+		return time.Second
+	}
+	earliest := time.Time{}
+	for _, backend := range backends {
+		backend.mu.RLock()
+		next := backend.nextCheckAt
+		backend.mu.RUnlock()
+		if earliest.IsZero() || next.Before(earliest) {
+			earliest = next
+		}
+	}
+	now := r.now()
+	r.mu.RUnlock()
+	wait := earliest.Sub(now)
+	if wait <= 0 {
+		return time.Millisecond
+	}
+	return wait
+}
+
+func (r *Registry) SetHealthOverride(rawURL string, health BackendHealth) error {
+	normalized, _, err := normalizeBackendURL(rawURL)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidBackend, err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	backend, exists := r.byURL[normalized]
+	if !exists {
+		return fmt.Errorf("%w: %s", ErrBackendNotFound, normalized)
+	}
+	r.healthOverrides[normalized] = health
+	effective := resolveBackendHealth(r.healthDefaults, health)
+	backend.mu.Lock()
+	backend.healthPath = effective.Path
+	backend.healthInterval = effective.Interval
+	backend.healthTimeout = effective.Timeout
+	backend.nextCheckAt = r.now()
+	backend.mu.Unlock()
 	return nil
 }
 

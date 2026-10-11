@@ -35,6 +35,10 @@ type Backend struct {
 	lastFailureKind            string
 	lastStateChange            time.Time
 	addedAt                    time.Time
+	healthPath                 string
+	healthInterval             time.Duration
+	healthTimeout              time.Duration
+	nextCheckAt                time.Time
 	lastAliveChange            time.Time
 	lastTransitionTimes        [16]time.Time
 	transitionCount            int
@@ -302,6 +306,10 @@ func (b *Backend) status() BackendStatus {
 		QuarantinedUntil:     b.quarantinedUntil,
 		QuarantineLevel:      b.quarantineLevel,
 		RecentTransitions:    b.recentTransitionsLocked(now),
+		HealthPath:           b.healthPath,
+		HealthInterval:       b.healthInterval.String(),
+		HealthTimeout:        b.healthTimeout.String(),
+		NextCheckAt:          b.nextCheckAt,
 	}
 	b.mu.Unlock()
 	status.TotalRequests = b.totalRequests.Load()
@@ -311,12 +319,13 @@ func (b *Backend) status() BackendStatus {
 }
 
 type Pool struct {
-	registry      *Registry
-	counter       uint64
-	healthTimeout time.Duration
-	failThreshold int
-	riseThreshold int
-	healthPath    string
+	registry       *Registry
+	counter        uint64
+	healthInterval time.Duration
+	healthTimeout  time.Duration
+	failThreshold  int
+	riseThreshold  int
+	healthPath     string
 }
 
 func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
@@ -335,7 +344,7 @@ func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
 			return nil, err
 		}
 	}
-	return &Pool{registry: registry, healthTimeout: 2 * time.Second, failThreshold: 3, riseThreshold: 2, healthPath: "/"}, nil
+	return &Pool{registry: registry, healthInterval: 5 * time.Second, healthTimeout: 2 * time.Second, failThreshold: 3, riseThreshold: 2, healthPath: "/"}, nil
 }
 
 func (p *Pool) Next() *Backend {
@@ -359,39 +368,41 @@ func (p *Pool) CheckOnce() {
 }
 
 func (p *Pool) CheckOnceContext(ctx context.Context) {
+	p.checkBackends(ctx, p.registry.reserveChecks(false))
+}
+
+func (p *Pool) CheckDue(ctx context.Context) {
+	p.checkBackends(ctx, p.registry.reserveChecks(true))
+}
+
+type backendCheck struct {
+	backend *Backend
+	started time.Time
+	path    string
+	timeout time.Duration
+}
+
+func (p *Pool) checkBackends(parent context.Context, checksToRun []backendCheck) {
 	var checks sync.WaitGroup
-	for _, backend := range p.registry.snapshot() {
-		if !backend.checking.CompareAndSwap(false, true) {
-			if backend.skipLogged.CompareAndSwap(false, true) {
-				log.Printf("health check for %s still running, skipping tick", backend.URL)
-			}
-			continue
-		}
-		backend.skipLogged.Store(false)
+	for _, check := range checksToRun {
+		check := check
 		checks.Add(1)
-		go func(backend *Backend) {
+		go func() {
 			defer checks.Done()
-			defer backend.checking.Store(false)
-			defer backend.skipLogged.Store(false)
-			p.checkBackend(ctx, backend)
-		}(backend)
+			defer check.backend.checking.Store(false)
+			defer check.backend.skipLogged.Store(false)
+			p.checkBackend(parent, check)
+		}()
 	}
 	checks.Wait()
 }
 
-func (p *Pool) checkBackend(parent context.Context, backend *Backend) {
-	timeout := p.healthTimeout
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
+func (p *Pool) checkBackend(parent context.Context, check backendCheck) {
+	backend := check.backend
+	ctx, cancel := context.WithTimeout(parent, check.timeout)
 	defer cancel()
 	probeURL := *backend.URL
-	path := p.healthPath
-	if path == "" {
-		path = "/"
-	}
-	probeURL.Path = path
+	probeURL.Path = check.path
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL.String(), nil)
 	if err != nil {
 		p.recordCheckResult(backend, false, classifyFailure(err), err)
@@ -450,6 +461,17 @@ func (p *Pool) ConfigureHealthChecks(timeout time.Duration, failThreshold, riseT
 	p.riseThreshold = riseThreshold
 	p.healthPath = path
 	p.registry.configureHealth(failThreshold, riseThreshold)
+	defaults := p.registry.healthDefaultsSnapshot()
+	defaults.Path = path
+	defaults.Timeout = timeout
+	p.registry.ConfigureHealthDefaults(defaults)
+}
+
+func (p *Pool) ConfigureHealthSchedule(interval, timeout time.Duration, path string) {
+	p.healthInterval = interval
+	p.healthTimeout = timeout
+	p.healthPath = path
+	p.registry.ConfigureHealthDefaults(BackendHealth{Path: path, Interval: interval, Timeout: timeout})
 }
 
 func (p *Pool) ConfigureFlapProtection(window time.Duration, maxTransitions int, base, maximum, resetAfter time.Duration, maxPercent int) {
@@ -457,14 +479,33 @@ func (p *Pool) ConfigureFlapProtection(window time.Duration, maxTransitions int,
 }
 
 func (p *Pool) HealthCheckContext(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	defaults := p.registry.healthDefaultsSnapshot()
+	defaults.Interval = interval
+	p.healthInterval = interval
+	p.registry.ConfigureHealthDefaults(defaults)
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		p.CheckDue(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		wait := p.registry.durationUntilNextCheck()
+		if wait > time.Second || wait <= 0 {
+			wait = time.Second
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
-		case <-ticker.C:
-			p.CheckOnceContext(ctx)
+		case <-timer.C:
 		}
 	}
 }
@@ -593,6 +634,12 @@ func main() {
 		log.Fatal(err)
 	}
 	pool.ConfigureHealthChecks(cfg.HealthTimeout, cfg.FailThreshold, cfg.RiseThreshold, cfg.HealthPath)
+	pool.ConfigureHealthSchedule(cfg.HealthInterval, cfg.HealthTimeout, cfg.HealthPath)
+	for backendURL, health := range cfg.BackendHealth {
+		if err := pool.registry.SetHealthOverride(backendURL, health); err != nil {
+			log.Fatalf("apply backend health settings: %v", err)
+		}
+	}
 	pool.ConfigureFlapProtection(cfg.FlapWindow, cfg.FlapMaxTransitions, cfg.QuarantineBase, cfg.QuarantineMax, cfg.QuarantineResetAfter, cfg.MaxQuarantinePercent)
 	go pool.HealthCheckContext(ctx, cfg.HealthInterval)
 

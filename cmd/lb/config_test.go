@@ -183,6 +183,168 @@ func TestLoadConfig_BackendsParsing(t *testing.T) {
 	}
 }
 
+func TestBackendHealthSpecParsing(t *testing.T) {
+	tests := []struct {
+		name     string
+		spec     string
+		path     string
+		interval time.Duration
+		timeout  time.Duration
+	}{
+		{"plain", "http://localhost:9001", "", 0, 0},
+		{"all options", "http://localhost:9002;health_path=/healthz;health_interval=2s;health_timeout=500ms", "/healthz", 2 * time.Second, 500 * time.Millisecond},
+		{"partial option", "http://localhost:9003;health_timeout=1s", "", 0, time.Second},
+		{"trim and case", " http://localhost:9004 ; HEALTH_PATH = /ready ; Health_Interval = 3s ", "/ready", 3 * time.Second, 0},
+		{"trailing separator", "http://localhost:9005;", "", 0, 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := " , " + test.spec + " , , "
+			cfg, err := LoadConfig(envLookup(map[string]string{"LB_BACKENDS": value}), nil)
+			if err != nil {
+				t.Fatalf("LoadConfig returned error: %v", err)
+			}
+			if len(cfg.Backends) != 1 {
+				t.Fatalf("Backends = %#v; want one non-empty URL", cfg.Backends)
+			}
+			health := cfg.BackendHealth[cfg.Backends[0]]
+			if health.Path != test.path || health.Interval != test.interval || health.Timeout != test.timeout {
+				t.Fatalf("BackendHealth = %#v; want path=%q interval=%s timeout=%s", health, test.path, test.interval, test.timeout)
+			}
+		})
+	}
+	cfg, err := LoadConfig(envLookup(nil), []string{"-backends", "http://localhost:9010;health_path=/probe;health_interval=2s;health_timeout=500ms"})
+	if err != nil {
+		t.Fatalf("LoadConfig flag spec returned error: %v", err)
+	}
+	if len(cfg.Backends) != 1 {
+		t.Fatalf("flag Backends = %#v; want one backend", cfg.Backends)
+	}
+	if got := cfg.BackendHealth[cfg.Backends[0]]; got != (BackendHealth{Path: "/probe", Interval: 2 * time.Second, Timeout: 500 * time.Millisecond}) {
+		t.Fatalf("flag BackendHealth = %#v", got)
+	}
+}
+
+func TestBackendHealthSpecErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		spec string
+		want string
+	}{
+		{"unknown key", "http://localhost:9101;unknown=x", "allowed options"},
+		{"duplicate key", "http://localhost:9101;health_path=/a;HEALTH_PATH=/b", "repeats option"},
+		{"empty value", "http://localhost:9101;health_timeout=", "empty option value"},
+		{"invalid duration", "http://localhost:9101;health_interval=abc", "invalid health_interval"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := LoadConfig(envLookup(map[string]string{"LB_BACKENDS": test.spec}), nil)
+			if err == nil || !strings.Contains(err.Error(), test.spec) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadConfig error = %v; want %q and %q", err, test.spec, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		spec string
+		want string
+	}{
+		{"negative interval", "http://localhost:9102;health_interval=-1s", "health_interval"},
+		{"path no slash", "http://localhost:9102;health_path=healthz", "health_path"},
+		{"path query", "http://localhost:9102;health_path=/a?b=1", "health_path"},
+		{"path spaces", "http://localhost:9102;health_path=/a b", "health_path"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := LoadConfig(envLookup(map[string]string{"LB_BACKENDS": test.spec}), nil)
+			if err != nil && !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadConfig error = %v; want %s", err, test.want)
+			}
+			if err == nil {
+				err = cfg.Validate()
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "localhost:9102") {
+				t.Fatalf("validation error = %v; want %s naming backend", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBackendHealthEffectiveValuesAndNormalizedDuplicates(t *testing.T) {
+	cfg, err := LoadConfig(envLookup(map[string]string{
+		"LB_BACKENDS": "http://Localhost:9001/;health_path=/a,http://localhost:9002;health_interval=3s",
+	}), nil)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	first := cfg.EffectiveBackendHealth(cfg.Backends[0])
+	if first.Path != "/a" || first.Interval != cfg.HealthInterval || first.Timeout != cfg.HealthTimeout {
+		t.Fatalf("first effective health = %#v; want override path and inherited durations", first)
+	}
+	second := cfg.EffectiveBackendHealth(cfg.Backends[1])
+	if second.Path != cfg.HealthPath || second.Interval != 3*time.Second || second.Timeout != cfg.HealthTimeout {
+		t.Fatalf("second effective health = %#v; want global path/timeout and interval override", second)
+	}
+
+	cfg, err = LoadConfig(envLookup(map[string]string{
+		"LB_BACKENDS": "http://Localhost:9001/;health_path=/a,http://localhost:9001",
+	}), nil)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if !strings.Contains(cfg.Validate().Error(), "duplicates") {
+		t.Fatal("normalized duplicate URLs with different options were not rejected")
+	}
+}
+
+func TestBackendHealthEffectiveValidationAndLargestFlapInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		backends string
+		interval string
+		want     string
+	}{
+		{"timeout equals interval", "http://a.example:9001;health_interval=2s;health_timeout=2s", "", "health_timeout"},
+		{"interval below minimum", "http://a.example:9001;health_interval=50ms;health_timeout=20ms", "", "100ms"},
+		{"flap window uses slow backend", "http://a.example:9001;health_interval=1s;health_timeout=500ms,http://b.example:9002;health_interval=10s;health_timeout=1s", "49s", "b.example"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := map[string]string{"LB_BACKENDS": test.backends}
+			if test.interval != "" {
+				env["LB_HEALTH_INTERVAL"] = "1s"
+				env["LB_HEALTH_TIMEOUT"] = "500ms"
+				env["LB_FLAP_WINDOW"] = test.interval
+			}
+			cfg, loadErr := LoadConfig(envLookup(env), nil)
+			if loadErr != nil {
+				t.Fatalf("LoadConfig returned error: %v", loadErr)
+			}
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate error = %v; want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBackendHealthWarningsArePerBackend(t *testing.T) {
+	cfg, err := LoadConfig(envLookup(map[string]string{
+		"LB_BACKENDS":        "http://fast.example:9001;health_interval=1s;health_timeout=500ms,http://slow.example:9002;health_interval=30s;health_timeout=1s",
+		"LB_HEALTH_INTERVAL": "5s",
+		"LB_HEALTH_TIMEOUT":  "2s",
+		"LB_FLAP_WINDOW":     "3m",
+		"LB_QUARANTINE_BASE": "1s",
+	}), nil)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	warnings := strings.Join(cfg.Warnings(), "\n")
+	if !strings.Contains(warnings, "slow.example") || !strings.Contains(warnings, "fast.example") {
+		t.Fatalf("per-backend warnings = %q; want both backend names", warnings)
+	}
+}
+
 func TestLoadConfig_InvalidDuration(t *testing.T) {
 	env := map[string]string{
 		"LB_HEALTH_INTERVAL":  "abc",
