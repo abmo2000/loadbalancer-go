@@ -26,6 +26,7 @@ type Config struct {
 	ListenAddr           string
 	Backends             []string
 	Strategy             string
+	MaxRetries           int
 	BackendHealth        map[string]BackendHealth
 	HealthInterval       time.Duration
 	HealthTimeout        time.Duration
@@ -121,12 +122,21 @@ func lookupEnvValue(getenv func(string) string, key string) (string, bool) {
 
 func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	cfg := DefaultConfig()
+	var parseProblems []error
 
 	if v, ok := lookupEnvValue(getenv, "LB_LISTEN_ADDR"); ok {
 		cfg.ListenAddr = v
 	}
 	if v, ok := lookupEnvValue(getenv, "LB_STRATEGY"); ok {
 		cfg.Strategy = v
+	}
+	if value, ok := lookupEnvValue(getenv, "LB_MAX_RETRIES"); ok {
+		retries, err := strconv.Atoi(value)
+		if err != nil {
+			parseProblems = append(parseProblems, fmt.Errorf("LB_MAX_RETRIES: %q must be an integer from 0 to 3", value))
+		} else {
+			cfg.MaxRetries = retries
+		}
 	}
 	backendsValue := strings.Join(cfg.Backends, ",")
 	if v, ok := lookupEnvValue(getenv, "LB_BACKENDS"); ok {
@@ -150,7 +160,6 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 		{"LB_QUARANTINE_MAX", &cfg.QuarantineMax},
 		{"LB_QUARANTINE_RESET_AFTER", &cfg.QuarantineResetAfter},
 	}
-	var parseProblems []error
 	for _, setting := range durationSettings {
 		if value, ok := lookupEnvValue(getenv, setting.name); ok {
 			duration, err := time.ParseDuration(value)
@@ -211,8 +220,10 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	var flagOutput bytes.Buffer
 	fs.SetOutput(&flagOutput)
 	listenAddr := cfg.ListenAddr
+	maxRetriesValue := strconv.Itoa(cfg.MaxRetries)
 	fs.StringVar(&listenAddr, "listen", cfg.ListenAddr, "listen address")
 	fs.StringVar(&cfg.Strategy, "strategy", cfg.Strategy, "load-balancing strategy: round_robin or least_conns")
+	fs.StringVar(&maxRetriesValue, "max-retries", maxRetriesValue, "maximum safe retries for dial failures (0 to 3)")
 	fs.StringVar(&backendsValue, "backends", backendsValue, "comma-separated backend URLs")
 	fs.DurationVar(&cfg.HealthInterval, "health-interval", cfg.HealthInterval, "health check interval")
 	fs.DurationVar(&cfg.HealthTimeout, "health-timeout", cfg.HealthTimeout, "health check HTTP client timeout")
@@ -249,6 +260,11 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 
 	cfg.ListenAddr = listenAddr
 	cfg.Strategy = strings.ToLower(strings.TrimSpace(cfg.Strategy))
+	if retries, err := strconv.Atoi(maxRetriesValue); err != nil {
+		parseProblems = append(parseProblems, fmt.Errorf("LB_MAX_RETRIES: %q must be an integer from 0 to 3", maxRetriesValue))
+	} else {
+		cfg.MaxRetries = retries
+	}
 	var backendParseProblems []error
 	cfg.Backends, cfg.BackendHealth, backendParseProblems = parseBackendSpecs(backendsValue)
 	parseProblems = append(parseProblems, backendParseProblems...)
@@ -328,6 +344,9 @@ func (c *Config) Validate() error {
 	case "round_robin", "least_conns":
 	default:
 		problems = append(problems, fmt.Errorf("LB_STRATEGY: %q must be one of round_robin, least_conns", c.Strategy))
+	}
+	if c.MaxRetries < 0 || c.MaxRetries > 3 {
+		problems = append(problems, fmt.Errorf("LB_MAX_RETRIES: %q must be an integer from 0 to 3", strconv.Itoa(c.MaxRetries)))
 	}
 
 	if len(c.Backends) == 0 {
@@ -595,6 +614,9 @@ func localHost(host string) bool {
 
 func (c Config) Warnings() []string {
 	var warnings []string
+	if c.MaxRetries >= len(c.Backends) {
+		warnings = append(warnings, fmt.Sprintf("LB_MAX_RETRIES %d is greater than or equal to the configured backend count %d; retries cannot all go to distinct backends", c.MaxRetries, len(c.Backends)))
+	}
 	if c.ShutdownTimeout > 0 && c.ResponseTimeout > 0 && c.ShutdownTimeout < c.ResponseTimeout {
 		warnings = append(warnings, fmt.Sprintf("LB_SHUTDOWN_TIMEOUT %q is shorter than LB_RESPONSE_TIMEOUT %q; in-flight requests may be cut off during shutdown", c.ShutdownTimeout, c.ResponseTimeout))
 	}
@@ -647,10 +669,11 @@ func (c Config) String() string {
 		backends = append(backends, entry)
 	}
 	return fmt.Sprintf(
-		"listen=%s backends=%v strategy=%s healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s flapWindow=%s flapMaxTransitions=%d quarantineBase=%s quarantineMax=%s quarantineResetAfter=%s maxQuarantinePercent=%d dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
+		"listen=%s backends=%v strategy=%s maxRetries=%d healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s flapWindow=%s flapMaxTransitions=%d quarantineBase=%s quarantineMax=%s quarantineResetAfter=%s maxQuarantinePercent=%d dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
 		c.ListenAddr,
 		backends,
 		c.Strategy,
+		c.MaxRetries,
 		c.HealthInterval,
 		c.HealthTimeout,
 		c.FailThreshold,

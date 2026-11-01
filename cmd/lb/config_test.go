@@ -35,7 +35,7 @@ func TestLoadConfig_Defaults(t *testing.T) {
 			t.Fatalf("Backends[%d] = %q; want %q", i, cfg.Backends[i], want.Backends[i])
 		}
 	}
-	if cfg.HealthInterval != want.HealthInterval || cfg.HealthTimeout != want.HealthTimeout || cfg.FailThreshold != want.FailThreshold || cfg.RiseThreshold != want.RiseThreshold || cfg.HealthPath != want.HealthPath || cfg.FlapWindow != want.FlapWindow || cfg.FlapMaxTransitions != want.FlapMaxTransitions || cfg.QuarantineBase != want.QuarantineBase || cfg.QuarantineMax != want.QuarantineMax || cfg.QuarantineResetAfter != want.QuarantineResetAfter || cfg.MaxQuarantinePercent != want.MaxQuarantinePercent || cfg.DialTimeout != want.DialTimeout || cfg.ResponseTimeout != want.ResponseTimeout || cfg.ReadHeaderTimeout != want.ReadHeaderTimeout || cfg.ReadTimeout != want.ReadTimeout || cfg.WriteTimeout != want.WriteTimeout || cfg.IdleTimeout != want.IdleTimeout || cfg.ShutdownTimeout != want.ShutdownTimeout {
+	if cfg.MaxRetries != want.MaxRetries || cfg.HealthInterval != want.HealthInterval || cfg.HealthTimeout != want.HealthTimeout || cfg.FailThreshold != want.FailThreshold || cfg.RiseThreshold != want.RiseThreshold || cfg.HealthPath != want.HealthPath || cfg.FlapWindow != want.FlapWindow || cfg.FlapMaxTransitions != want.FlapMaxTransitions || cfg.QuarantineBase != want.QuarantineBase || cfg.QuarantineMax != want.QuarantineMax || cfg.QuarantineResetAfter != want.QuarantineResetAfter || cfg.MaxQuarantinePercent != want.MaxQuarantinePercent || cfg.DialTimeout != want.DialTimeout || cfg.ResponseTimeout != want.ResponseTimeout || cfg.ReadHeaderTimeout != want.ReadHeaderTimeout || cfg.ReadTimeout != want.ReadTimeout || cfg.WriteTimeout != want.WriteTimeout || cfg.IdleTimeout != want.IdleTimeout || cfg.ShutdownTimeout != want.ShutdownTimeout {
 		t.Fatalf("unexpected default values: %#v; want %#v", cfg, want)
 	}
 }
@@ -44,6 +44,7 @@ func TestLoadConfig_EnvOverridesDefaults(t *testing.T) {
 	env := map[string]string{
 		"LB_LISTEN_ADDR":            ":9090",
 		"LB_BACKENDS":               "http://10.0.0.5:8000, http://10.0.0.6:8000",
+		"LB_MAX_RETRIES":            "2",
 		"LB_HEALTH_INTERVAL":        "250ms",
 		"LB_HEALTH_TIMEOUT":         "750ms",
 		"LB_HEALTH_FAIL_THRESHOLD":  "4",
@@ -73,7 +74,7 @@ func TestLoadConfig_EnvOverridesDefaults(t *testing.T) {
 	if got, want := cfg.Backends, []string{"http://10.0.0.5:8000", "http://10.0.0.6:8000"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("Backends = %#v; want %#v", got, want)
 	}
-	if cfg.HealthInterval != 250*time.Millisecond || cfg.HealthTimeout != 750*time.Millisecond || cfg.FailThreshold != 4 || cfg.RiseThreshold != 5 || cfg.HealthPath != "/healthz" || cfg.FlapWindow != 90*time.Second || cfg.FlapMaxTransitions != 5 || cfg.QuarantineBase != 10*time.Second || cfg.QuarantineMax != 2*time.Minute || cfg.QuarantineResetAfter != 4*time.Minute || cfg.MaxQuarantinePercent != 40 || cfg.DialTimeout != 2*time.Second || cfg.ResponseTimeout != 15*time.Second || cfg.ReadHeaderTimeout != 4*time.Second || cfg.ReadTimeout != 12*time.Second || cfg.WriteTimeout != 20*time.Second || cfg.IdleTimeout != 30*time.Second || cfg.ShutdownTimeout != 18*time.Second {
+	if cfg.MaxRetries != 2 || cfg.HealthInterval != 250*time.Millisecond || cfg.HealthTimeout != 750*time.Millisecond || cfg.FailThreshold != 4 || cfg.RiseThreshold != 5 || cfg.HealthPath != "/healthz" || cfg.FlapWindow != 90*time.Second || cfg.FlapMaxTransitions != 5 || cfg.QuarantineBase != 10*time.Second || cfg.QuarantineMax != 2*time.Minute || cfg.QuarantineResetAfter != 4*time.Minute || cfg.MaxQuarantinePercent != 40 || cfg.DialTimeout != 2*time.Second || cfg.ResponseTimeout != 15*time.Second || cfg.ReadHeaderTimeout != 4*time.Second || cfg.ReadTimeout != 12*time.Second || cfg.WriteTimeout != 20*time.Second || cfg.IdleTimeout != 30*time.Second || cfg.ShutdownTimeout != 18*time.Second {
 		t.Fatalf("unexpected env-derived config: %#v", cfg)
 	}
 }
@@ -82,6 +83,7 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	env := map[string]string{
 		"LB_LISTEN_ADDR":            ":9090",
 		"LB_BACKENDS":               "http://10.0.0.5:8000",
+		"LB_MAX_RETRIES":            "2",
 		"LB_HEALTH_INTERVAL":        "250ms",
 		"LB_HEALTH_TIMEOUT":         "750ms",
 		"LB_HEALTH_FAIL_THRESHOLD":  "4",
@@ -104,6 +106,7 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	cfg, err := LoadConfig(envLookup(env), []string{
 		"-listen", ":9191",
 		"-backends", "http://10.0.0.7:8000,http://10.0.0.8:8000",
+		"-max-retries", "3",
 		"-health-interval", "300ms",
 		"-health-timeout", "900ms",
 		"-health-fail-threshold", "6",
@@ -132,7 +135,7 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	if got, want := cfg.Backends, []string{"http://10.0.0.7:8000", "http://10.0.0.8:8000"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("Backends = %#v; want %#v", got, want)
 	}
-	if cfg.HealthInterval != 300*time.Millisecond || cfg.HealthTimeout != 900*time.Millisecond || cfg.FailThreshold != 6 || cfg.RiseThreshold != 7 || cfg.HealthPath != "/ready" || cfg.FlapWindow != 120*time.Second || cfg.FlapMaxTransitions != 6 || cfg.QuarantineBase != 15*time.Second || cfg.QuarantineMax != 3*time.Minute || cfg.QuarantineResetAfter != 6*time.Minute || cfg.MaxQuarantinePercent != 60 || cfg.DialTimeout != 3*time.Second || cfg.ResponseTimeout != 16*time.Second || cfg.ReadHeaderTimeout != 5*time.Second || cfg.ReadTimeout != 13*time.Second || cfg.WriteTimeout != 21*time.Second || cfg.IdleTimeout != 31*time.Second || cfg.ShutdownTimeout != 19*time.Second {
+	if cfg.MaxRetries != 3 || cfg.HealthInterval != 300*time.Millisecond || cfg.HealthTimeout != 900*time.Millisecond || cfg.FailThreshold != 6 || cfg.RiseThreshold != 7 || cfg.HealthPath != "/ready" || cfg.FlapWindow != 120*time.Second || cfg.FlapMaxTransitions != 6 || cfg.QuarantineBase != 15*time.Second || cfg.QuarantineMax != 3*time.Minute || cfg.QuarantineResetAfter != 6*time.Minute || cfg.MaxQuarantinePercent != 60 || cfg.DialTimeout != 3*time.Second || cfg.ResponseTimeout != 16*time.Second || cfg.ReadHeaderTimeout != 5*time.Second || cfg.ReadTimeout != 13*time.Second || cfg.WriteTimeout != 21*time.Second || cfg.IdleTimeout != 31*time.Second || cfg.ShutdownTimeout != 19*time.Second {
 		t.Fatalf("unexpected flag-derived config: %#v", cfg)
 	}
 }
@@ -170,6 +173,54 @@ func TestStrategyConfig(t *testing.T) {
 		"LB_RESPONSE_TIMEOUT": "later",
 	}), nil)
 	assertConfigError(t, errors.Join(parseErr, aggregated.Validate()), "LB_STRATEGY", "fastest", "LB_RESPONSE_TIMEOUT", "later")
+}
+
+func TestMaxRetriesConfig(t *testing.T) {
+	cfg, err := LoadConfig(envLookup(nil), nil)
+	if err != nil || cfg.MaxRetries != 0 {
+		t.Fatalf("default max retries = %d, error = %v; want 0", cfg.MaxRetries, err)
+	}
+
+	cfg, err = LoadConfig(envLookup(map[string]string{"LB_MAX_RETRIES": "1"}), nil)
+	if err != nil || cfg.MaxRetries != 1 {
+		t.Fatalf("env max retries = %d, error = %v; want 1", cfg.MaxRetries, err)
+	}
+
+	cfg, err = LoadConfig(envLookup(map[string]string{"LB_MAX_RETRIES": "2"}), []string{"-max-retries", "3"})
+	if err != nil || cfg.MaxRetries != 3 {
+		t.Fatalf("flag max retries = %d, error = %v; want 3", cfg.MaxRetries, err)
+	}
+	if !strings.Contains(cfg.String(), "maxRetries=3") {
+		t.Fatalf("effective config %q does not report max retries", cfg.String())
+	}
+
+	for _, value := range []string{"-1", "4", "abc"} {
+		t.Run("invalid "+value, func(t *testing.T) {
+			invalid, parseErr := LoadConfig(envLookup(map[string]string{"LB_MAX_RETRIES": value}), nil)
+			assertConfigError(t, errors.Join(parseErr, invalid.Validate()), "LB_MAX_RETRIES", value, "0 to 3")
+		})
+	}
+	_, flagErr := LoadConfig(envLookup(nil), []string{"-max-retries", "abc"})
+	assertConfigError(t, flagErr, "LB_MAX_RETRIES", "abc", "0 to 3")
+
+	invalid, parseErr := LoadConfig(envLookup(map[string]string{
+		"LB_MAX_RETRIES":      "4",
+		"LB_RESPONSE_TIMEOUT": "later",
+	}), nil)
+	assertConfigError(t, errors.Join(parseErr, invalid.Validate()), "LB_MAX_RETRIES", "4", "LB_RESPONSE_TIMEOUT", "later")
+
+	warningConfig := DefaultConfig()
+	warningConfig.MaxRetries = len(warningConfig.Backends)
+	warnings := warningConfig.Warnings()
+	foundWarning := false
+	for _, warning := range warnings {
+		if strings.Contains(warning, "LB_MAX_RETRIES") && strings.Contains(warning, "distinct backends") {
+			foundWarning = true
+		}
+	}
+	if !foundWarning {
+		t.Fatalf("Warnings = %#v; want retry count vs backend count warning", warnings)
+	}
 }
 
 func TestLoadConfig_CheckOnly(t *testing.T) {

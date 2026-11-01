@@ -64,6 +64,12 @@ type Backend struct {
 	quarantineResetAfter       time.Duration
 }
 
+type proxyAttemptContextKey struct{}
+
+type proxyAttemptResult struct {
+	err error
+}
+
 func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 	dialTimeout := 3 * time.Second
 	responseTimeout := 10 * time.Second
@@ -108,10 +114,14 @@ func NewBackend(u *url.URL, args ...time.Duration) *Backend {
 		},
 	}
 	b.Proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
 			return
 		}
 		logHealthEvents(b, b.recordProxyFailure(err))
+		if attempt, ok := r.Context().Value(proxyAttemptContextKey{}).(*proxyAttemptResult); ok {
+			attempt.err = err
+			return
+		}
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 	}
 	return b
@@ -282,6 +292,18 @@ func isHardProxyFailure(err error) bool {
 	return errors.As(err, &operationError) && operationError.Op == "dial"
 }
 
+func isRetryableDialFailure(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+		return true
+	}
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		return true
+	}
+	var operationError *net.OpError
+	return errors.As(err, &operationError) && operationError.Op == "dial"
+}
+
 func (b *Backend) status() BackendStatus {
 	b.mu.Lock()
 	now := b.currentTime()
@@ -323,11 +345,26 @@ type Pool struct {
 	counter        atomic.Uint64
 	strategyCount  atomic.Uint64
 	strategy       Strategy
+	maxRetries     int
+	retries        atomic.Uint64
+	exhausted      atomic.Uint64
 	healthInterval time.Duration
 	healthTimeout  time.Duration
 	failThreshold  int
 	riseThreshold  int
 	healthPath     string
+}
+
+type RetryStatistics struct {
+	RetriesPerformed  uint64
+	RequestsExhausted uint64
+}
+
+func (p *Pool) RetryStats() RetryStatistics {
+	return RetryStatistics{
+		RetriesPerformed:  p.retries.Load(),
+		RequestsExhausted: p.exhausted.Load(),
+	}
 }
 
 type Strategy interface {
@@ -344,9 +381,20 @@ func (strategy *roundRobinStrategy) Pick(candidates, snapshot []*Backend, _ bool
 	}
 	start := strategy.counter.Add(1)
 	n := uint64(len(snapshot))
+	var candidateSet map[*Backend]struct{}
+	if len(candidates) != len(snapshot) {
+		candidateSet = make(map[*Backend]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			candidateSet[candidate] = struct{}{}
+		}
+	}
 	for offset := uint64(0); offset < n; offset++ {
 		backend := snapshot[(start+offset)%n]
-		if backend.IsAlive() {
+		_, eligible := candidateSet[backend]
+		if candidateSet == nil {
+			eligible = true
+		}
+		if eligible && backend.IsAlive() {
 			return backend, false
 		}
 	}
@@ -423,9 +471,16 @@ func (p *Pool) Next() *Backend {
 }
 
 func (p *Pool) next(reserve bool) (*Backend, bool) {
+	return p.nextExcluding(nil, reserve)
+}
+
+func (p *Pool) nextExcluding(excluded map[*Backend]struct{}, reserve bool) (*Backend, bool) {
 	backends := p.registry.snapshot()
 	candidates := make([]*Backend, 0, len(backends))
 	for _, backend := range backends {
+		if _, wasTried := excluded[backend]; wasTried {
+			continue
+		}
 		if backend.IsAlive() {
 			candidates = append(candidates, backend)
 		}
@@ -588,19 +643,105 @@ func (p *Pool) HealthCheck(interval time.Duration) {
 	p.HealthCheckContext(context.Background(), interval)
 }
 
+type trackingResponseWriter struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (writer *trackingResponseWriter) WriteHeader(statusCode int) {
+	writer.wrote = true
+	writer.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (writer *trackingResponseWriter) Write(body []byte) (int, error) {
+	writer.wrote = true
+	return writer.ResponseWriter.Write(body)
+}
+
+func (writer *trackingResponseWriter) FlushError() error {
+	writer.wrote = true
+	return http.NewResponseController(writer.ResponseWriter).Flush()
+}
+
+func (writer *trackingResponseWriter) Flush() {
+	_ = writer.FlushError()
+}
+
+func (writer *trackingResponseWriter) Unwrap() http.ResponseWriter {
+	return writer.ResponseWriter
+}
+
+func shouldRetryRequest(request *http.Request, err error, responseStarted bool) bool {
+	// Retry only a proven dial failure for a bodyless safe method, with a live client context and no response output.
+	if responseStarted || request.Context().Err() != nil || !isRetryableDialFailure(err) {
+		return false
+	}
+	switch request.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	default:
+		return false
+	}
+	return request.Body == nil || request.Body == http.NoBody || request.ContentLength == 0
+}
+
+func (p *Pool) proxyAttempt(w http.ResponseWriter, r *http.Request, backend *Backend, reserved bool) (error, bool) {
+	if !reserved {
+		backend.activeConns.Add(1)
+	}
+	defer backend.activeConns.Add(-1)
+	backend.totalRequests.Add(1)
+
+	attempt := &proxyAttemptResult{}
+	request := r.WithContext(context.WithValue(r.Context(), proxyAttemptContextKey{}, attempt))
+	writer := &trackingResponseWriter{ResponseWriter: w}
+	backend.Proxy.ServeHTTP(writer, request)
+	return attempt.err, writer.wrote
+}
+
 func (p *Pool) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, reserved := p.next(true)
-		if b == nil {
-			http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
-			return
+		tried := make(map[*Backend]struct{})
+		attempts := 0
+		retryPending := false
+		for {
+			backend, reserved := p.nextExcluding(tried, true)
+			if backend == nil {
+				if attempts == 0 {
+					http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
+					return
+				}
+				if retryPending {
+					p.exhausted.Add(1)
+				}
+				http.Error(w, "backend unavailable", http.StatusBadGateway)
+				return
+			}
+			tried[backend] = struct{}{}
+			if attempts > 0 {
+				p.retries.Add(1)
+			}
+			// Go's Transport may transparently retry idempotent requests on reused connections; these application retries are separate.
+			err, responseStarted := p.proxyAttempt(w, r, backend, reserved)
+			if err == nil {
+				return
+			}
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if !shouldRetryRequest(r, err, responseStarted) {
+				if !responseStarted {
+					http.Error(w, "backend unavailable", http.StatusBadGateway)
+				}
+				return
+			}
+			retryPending = true
+			if attempts >= p.maxRetries {
+				p.exhausted.Add(1)
+				http.Error(w, "backend unavailable", http.StatusBadGateway)
+				return
+			}
+			attempts++
 		}
-		if !reserved {
-			b.activeConns.Add(1)
-		}
-		defer b.activeConns.Add(-1)
-		b.totalRequests.Add(1)
-		b.Proxy.ServeHTTP(w, r)
 	})
 }
 
@@ -712,6 +853,7 @@ func main() {
 	if err := pool.SetStrategy(cfg.Strategy); err != nil {
 		log.Fatal(err)
 	}
+	pool.maxRetries = cfg.MaxRetries
 	pool.ConfigureHealthChecks(cfg.HealthTimeout, cfg.FailThreshold, cfg.RiseThreshold, cfg.HealthPath)
 	pool.ConfigureHealthSchedule(cfg.HealthInterval, cfg.HealthTimeout, cfg.HealthPath)
 	for backendURL, health := range cfg.BackendHealth {

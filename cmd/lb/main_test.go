@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -83,6 +85,29 @@ func newLeastConnsPool(t *testing.T, targets ...string) *Pool {
 		t.Fatalf("SetStrategy returned error: %v", err)
 	}
 	return pool
+}
+
+func newRetryPool(t *testing.T, maxRetries int, strategy string, targets ...string) *Pool {
+	t.Helper()
+	pool, err := NewPool(targets)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.maxRetries = maxRetries
+	if strategy != "" {
+		if err := pool.SetStrategy(strategy); err != nil {
+			t.Fatalf("SetStrategy returned error: %v", err)
+		}
+	}
+	return pool
+}
+
+func newRefusedBackendURL(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	target := server.URL
+	server.Close()
+	return target
 }
 
 func waitForServerReady(t *testing.T, addr string) {
@@ -518,6 +543,422 @@ func TestLeastConnsRegistryRaceDuringTraffic(t *testing.T) {
 	}
 	if hits.Load() == 0 {
 		t.Fatal("no traffic reached a backend")
+	}
+}
+
+func TestRetriesDisabledByDefault(t *testing.T) {
+	pool, err := NewPool([]string{newRefusedBackendURL(t)})
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	response := doRequest(t, pool)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "backend unavailable") {
+		t.Fatalf("default retry response = %d %q; want 502 backend unavailable", response.Code, response.Body.String())
+	}
+	if stats := pool.RetryStats(); stats.RetriesPerformed != 0 {
+		t.Fatalf("default retry stats = %#v; want no retries", stats)
+	}
+}
+
+func TestRetryFailureClassificationUsesTypedErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "connection refused", err: syscall.ECONNREFUSED, want: true},
+		{name: "dns", err: &net.DNSError{Err: "no such host", Name: "backend.invalid"}, want: true},
+		{name: "dial timeout", err: &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded}, want: true},
+		{name: "network unreachable", err: syscall.ENETUNREACH, want: true},
+		{name: "host unreachable", err: syscall.EHOSTUNREACH, want: true},
+		{name: "header timeout", err: context.DeadlineExceeded, want: false},
+		{name: "similar text", err: errors.New("connection refused"), want: false},
+		{name: "read failure", err: &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset")}, want: false},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isRetryableDialFailure(test.err); got != test.want {
+				t.Fatalf("isRetryableDialFailure(%T) = %t; want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestSafeRetryAfterDialFailure(t *testing.T) {
+	refusedURL := newRefusedBackendURL(t)
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		healthyHits.Add(1)
+		_, _ = fmt.Fprint(w, "healthy")
+	}))
+	defer healthy.Close()
+	pool := newRetryPool(t, 1, "round_robin", healthy.URL, refusedURL)
+
+	response := doRequest(t, pool)
+	if response.Code != http.StatusOK || strings.TrimSpace(response.Body.String()) != "healthy" {
+		t.Fatalf("retry response = %d %q; want 200 from healthy backend", response.Code, response.Body.String())
+	}
+	if healthyHits.Load() != 1 {
+		t.Fatalf("healthy backend received %d requests; want 1", healthyHits.Load())
+	}
+	refused, ok := pool.registry.Get(refusedURL)
+	if !ok || refused.IsAlive() {
+		t.Fatal("refused backend should be marked dead after the retry")
+	}
+	if stats := pool.RetryStats(); stats.RetriesPerformed != 1 || stats.RequestsExhausted != 0 {
+		t.Fatalf("retry stats = %#v; want one retry and no exhaustion", stats)
+	}
+}
+
+func TestSafeRetryHeadAndOptions(t *testing.T) {
+	for _, method := range []string{http.MethodHead, http.MethodOptions} {
+		t.Run(method, func(t *testing.T) {
+			refusedURL := newRefusedBackendURL(t)
+			methods := make(chan string, 1)
+			healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				methods <- r.Method
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer healthy.Close()
+			pool := newRetryPool(t, 1, "round_robin", healthy.URL, refusedURL)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(method, "http://balancer.test/", nil)
+			pool.Handler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("%s response = %d; want 200", method, recorder.Code)
+			}
+			if got := <-methods; got != method {
+				t.Fatalf("healthy backend received %s; want %s", got, method)
+			}
+		})
+	}
+}
+
+func TestUnsafeMethodsAndBodyAreNotRetried(t *testing.T) {
+	cases := []struct {
+		name     string
+		method   string
+		withBody bool
+	}{
+		{name: "POST", method: http.MethodPost},
+		{name: "PUT", method: http.MethodPut},
+		{name: "PATCH", method: http.MethodPatch},
+		{name: "DELETE", method: http.MethodDelete},
+		{name: "GET with body", method: http.MethodGet, withBody: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			refusedURL := newRefusedBackendURL(t)
+			var healthyHits atomic.Int32
+			healthy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				healthyHits.Add(1)
+			}))
+			defer healthy.Close()
+			pool := newRetryPool(t, 1, "round_robin", healthy.URL, refusedURL)
+			recorder := httptest.NewRecorder()
+			var request *http.Request
+			if test.withBody {
+				request = httptest.NewRequest(test.method, "http://balancer.test/", strings.NewReader("payload"))
+			} else {
+				request = httptest.NewRequest(test.method, "http://balancer.test/", nil)
+			}
+			pool.Handler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("response = %d; want 502", recorder.Code)
+			}
+			if healthyHits.Load() != 0 {
+				t.Fatalf("healthy backend received %d requests; unsafe request must not retry", healthyHits.Load())
+			}
+			if stats := pool.RetryStats(); stats.RetriesPerformed != 0 {
+				t.Fatalf("retry stats = %#v; want no retries", stats)
+			}
+		})
+	}
+}
+
+func TestRetryDoesNotRepeatBackendAndTracksExhaustion(t *testing.T) {
+	firstURL := newRefusedBackendURL(t)
+	secondURL := newRefusedBackendURL(t)
+	pool := newRetryPool(t, 3, "round_robin", firstURL, secondURL)
+	response := doRequest(t, pool)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("response = %d; want 502", response.Code)
+	}
+	for _, target := range []string{firstURL, secondURL} {
+		backend, ok := pool.registry.Get(target)
+		if !ok {
+			t.Fatalf("backend %s missing from registry", target)
+		}
+		status := backend.status()
+		if status.TotalRequests != 1 || status.ActiveConns != 0 {
+			t.Fatalf("backend %s counters = %#v; want one attempt and no active connections", target, status)
+		}
+	}
+	if stats := pool.RetryStats(); stats.RetriesPerformed != 1 || stats.RequestsExhausted != 1 {
+		t.Fatalf("retry stats = %#v; want one retry and one exhausted request", stats)
+	}
+}
+
+func TestResponseHeaderTimeoutIsNotRetried(t *testing.T) {
+	blocked := newBlockingTestBackend(t, "late response")
+	healthyHits := atomic.Int32{}
+	healthy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		healthyHits.Add(1)
+	}))
+	defer healthy.Close()
+	pool, err := NewPool([]string{healthy.URL, blocked.server.URL}, time.Second, 80*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	pool.maxRetries = 1
+	response := make(chan int, 1)
+	go func() {
+		recorder := doRequest(t, pool)
+		response <- recorder.Code
+	}()
+	waitForSignal(t, blocked.arrived, "backend request before response-header timeout")
+	if code := waitForResult(t, response, "response-header timeout", 2*time.Second); code != http.StatusBadGateway {
+		t.Fatalf("response-header timeout returned %d; want 502", code)
+	}
+	if healthyHits.Load() != 0 {
+		t.Fatalf("second backend received %d requests; response-header timeout must not retry", healthyHits.Load())
+	}
+	if stats := pool.RetryStats(); stats.RetriesPerformed != 0 || stats.RequestsExhausted != 0 {
+		t.Fatalf("retry stats = %#v; timeout is not retryable", stats)
+	}
+}
+
+func TestBackendStatusFiveHundredIsNotRetried(t *testing.T) {
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		healthyHits.Add(1)
+	}))
+	defer healthy.Close()
+	serverError := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream failure", http.StatusInternalServerError)
+	}))
+	defer serverError.Close()
+	pool := newRetryPool(t, 3, "round_robin", healthy.URL, serverError.URL)
+	response := doRequest(t, pool)
+	if response.Code != http.StatusInternalServerError || response.Body.String() != "upstream failure\n" {
+		t.Fatalf("response = %d %q; want unchanged 500 response", response.Code, response.Body.String())
+	}
+	if healthyHits.Load() != 0 {
+		t.Fatalf("healthy backend received %d requests; 500 response must not retry", healthyHits.Load())
+	}
+}
+
+func TestPartialResponseFailureIsNotRetried(t *testing.T) {
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		healthyHits.Add(1)
+	}))
+	defer healthy.Close()
+	partial := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("test server response writer does not support hijacking")
+			return
+		}
+		connection, buffered, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+			return
+		}
+		_, _ = io.WriteString(buffered, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+		_ = buffered.Flush()
+		_ = connection.Close()
+	}))
+	defer partial.Close()
+	pool := newRetryPool(t, 1, "round_robin", healthy.URL, partial.URL)
+	response := doRequest(t, pool)
+	if response.Code != http.StatusOK || response.Body.String() != "partial" {
+		t.Fatalf("partial response = %d %q; want only the original partial 200 response", response.Code, response.Body.String())
+	}
+	if healthyHits.Load() != 0 {
+		t.Fatalf("second backend received %d requests; partial response must not retry", healthyHits.Load())
+	}
+	if stats := pool.RetryStats(); stats.RetriesPerformed != 0 {
+		t.Fatalf("retry stats = %#v; partial response must not retry", stats)
+	}
+}
+
+func TestClientCancellationIsNotRetriedOrCountedAsFailure(t *testing.T) {
+	blocked := newBlockingTestBackend(t, "done")
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		healthyHits.Add(1)
+	}))
+	defer healthy.Close()
+	pool := newRetryPool(t, 1, "round_robin", healthy.URL, blocked.server.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		request := httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil).WithContext(ctx)
+		pool.Handler().ServeHTTP(httptest.NewRecorder(), request)
+		close(done)
+	}()
+	waitForSignal(t, blocked.arrived, "request reaching cancellable backend")
+	cancel()
+	waitForSignal(t, done, "cancelled proxy request completion")
+	backend, ok := pool.registry.Get(blocked.server.URL)
+	if !ok {
+		t.Fatal("blocked backend missing from registry")
+	}
+	status := backend.status()
+	if status.TotalFailures != 0 || status.ActiveConns != 0 || !status.Alive {
+		t.Fatalf("cancelled backend status = %#v; want no failure, zero active, alive", status)
+	}
+	if healthyHits.Load() != 0 || pool.RetryStats().RetriesPerformed != 0 {
+		t.Fatalf("cancellation was retried: healthy hits=%d stats=%#v", healthyHits.Load(), pool.RetryStats())
+	}
+}
+
+func TestRetryLeastConnsUsesUntriedBackend(t *testing.T) {
+	refusedURL := newRefusedBackendURL(t)
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		healthyHits.Add(1)
+		_, _ = fmt.Fprint(w, "healthy")
+	}))
+	defer healthy.Close()
+	pool := newRetryPool(t, 1, "least_conns", refusedURL, healthy.URL)
+	response := doRequest(t, pool)
+	if response.Code != http.StatusOK || healthyHits.Load() != 1 {
+		t.Fatalf("least-connections retry returned %d with %d healthy hits; want one successful untried backend", response.Code, healthyHits.Load())
+	}
+	if stats := pool.RetryStats(); stats.RetriesPerformed != 1 {
+		t.Fatalf("retry stats = %#v; want one retry", stats)
+	}
+}
+
+func TestRetryConnectionAccountingForBothStrategies(t *testing.T) {
+	for _, strategy := range []string{"round_robin", "least_conns"} {
+		t.Run(strategy, func(t *testing.T) {
+			refusedURL := newRefusedBackendURL(t)
+			var healthyHits atomic.Int32
+			healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				healthyHits.Add(1)
+				_, _ = fmt.Fprint(w, "ok")
+			}))
+			defer healthy.Close()
+			targets := []string{healthy.URL, refusedURL}
+			if strategy == "least_conns" {
+				targets = []string{refusedURL, healthy.URL}
+			}
+			pool := newRetryPool(t, 1, strategy, targets...)
+			if response := doRequest(t, pool); response.Code != http.StatusOK {
+				t.Fatalf("successful retry returned %d; want 200", response.Code)
+			}
+			for _, target := range targets {
+				backend, _ := pool.registry.Get(target)
+				if got := backend.activeConns.Load(); got != 0 {
+					t.Fatalf("backend %s ActiveConns = %d after retry; want 0", target, got)
+				}
+			}
+
+			firstFailureURL := newRefusedBackendURL(t)
+			secondFailureURL := newRefusedBackendURL(t)
+			failedPool := newRetryPool(t, 1, strategy, firstFailureURL, secondFailureURL)
+			if response := doRequest(t, failedPool); response.Code != http.StatusBadGateway {
+				t.Fatalf("exhausted retry returned %d; want 502", response.Code)
+			}
+			for _, target := range []string{firstFailureURL, secondFailureURL} {
+				backend, _ := failedPool.registry.Get(target)
+				if got := backend.activeConns.Load(); got != 0 {
+					t.Fatalf("failed backend %s ActiveConns = %d; want 0", target, got)
+				}
+			}
+		})
+	}
+}
+
+func TestParallelRetriesWithOneDeadBackend(t *testing.T) {
+	refusedURL := newRefusedBackendURL(t)
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		healthyHits.Add(1)
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer healthy.Close()
+	pool := newRetryPool(t, 1, "round_robin", healthy.URL, refusedURL)
+	responses := make(chan int, 100)
+	var requests sync.WaitGroup
+	for range 100 {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			responses <- doRequest(t, pool).Code
+		}()
+	}
+	requests.Wait()
+	close(responses)
+	for status := range responses {
+		if status != http.StatusOK {
+			t.Fatalf("parallel GET status = %d; want 200", status)
+		}
+	}
+	if healthyHits.Load() != 100 {
+		t.Fatalf("healthy backend handled %d requests; want 100", healthyHits.Load())
+	}
+}
+
+func TestRetryRegistryRaceDuringTraffic(t *testing.T) {
+	blocking := newBlockingTestBackend(t, "released")
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		healthyHits.Add(1)
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer healthy.Close()
+	refusedURL := newRefusedBackendURL(t)
+	pool := newRetryPool(t, 1, "least_conns", blocking.server.URL, healthy.URL, refusedURL)
+	handler := pool.Handler()
+	start := make(chan struct{})
+	statuses := make(chan int, 60)
+	var requests sync.WaitGroup
+	for range 60 {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			<-start
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+			statuses <- recorder.Code
+		}()
+	}
+	close(start)
+	waitForSignal(t, blocking.arrived, "request held during registry changes")
+	mutation := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "mutation")
+	}))
+	t.Cleanup(mutation.Close)
+	for iteration := range 20 {
+		if err := pool.registry.SetAlive(blocking.server.URL, iteration%2 == 0); err != nil {
+			t.Fatalf("SetAlive blocking backend: %v", err)
+		}
+		if err := pool.registry.SetAlive(healthy.URL, iteration%2 != 0); err != nil {
+			t.Fatalf("SetAlive healthy backend: %v", err)
+		}
+		if _, err := pool.registry.Add(mutation.URL); err != nil {
+			t.Fatalf("Add mutation backend: %v", err)
+		}
+		_ = pool.registry.List()
+		if err := pool.registry.Remove(mutation.URL); err != nil {
+			t.Fatalf("Remove mutation backend: %v", err)
+		}
+	}
+	blocking.Release()
+	requests.Wait()
+	close(statuses)
+	for status := range statuses {
+		if status != http.StatusOK && status != http.StatusBadGateway && status != http.StatusServiceUnavailable {
+			t.Fatalf("request status = %d; want only 200, 502, or 503", status)
+		}
+	}
+	if healthyHits.Load() == 0 {
+		t.Fatal("healthy backend received no traffic")
 	}
 }
 
