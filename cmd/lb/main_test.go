@@ -73,6 +73,18 @@ func doRequest(t *testing.T, pool *Pool) *httptest.ResponseRecorder {
 	return rec
 }
 
+func newLeastConnsPool(t *testing.T, targets ...string) *Pool {
+	t.Helper()
+	pool, err := NewPool(targets)
+	if err != nil {
+		t.Fatalf("NewPool returned error: %v", err)
+	}
+	if err := pool.SetStrategy("least_conns"); err != nil {
+		t.Fatalf("SetStrategy returned error: %v", err)
+	}
+	return pool
+}
+
 func waitForServerReady(t *testing.T, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -198,6 +210,314 @@ func TestRoundRobin(t *testing.T) {
 		if counts[backendName] != 3 {
 			t.Fatalf("backend %s saw %d requests, want 3", backendName, counts[backendName])
 		}
+	}
+}
+
+func TestRoundRobinMaintainsRotationWhenBackendUnavailable(t *testing.T) {
+	first := newControllableBackend(t, "first")
+	second := newControllableBackend(t, "second")
+	third := newControllableBackend(t, "third")
+	defer first.Close()
+	defer second.Close()
+	defer third.Close()
+
+	pool := newPoolFromBackends(t, first, second, third)
+	if err := pool.registry.SetAlive(second.Target(), false); err != nil {
+		t.Fatalf("SetAlive second backend: %v", err)
+	}
+	want := []string{third.Target(), third.Target(), first.Target(), third.Target(), third.Target(), first.Target()}
+	for index, expected := range want {
+		if got := pool.Next().URL.String(); got != expected {
+			t.Fatalf("selection %d = %s; want legacy round-robin backend %s", index, got, expected)
+		}
+	}
+}
+
+func TestLeastConnsPicksLowestActiveCount(t *testing.T) {
+	first := newControllableBackend(t, "first")
+	second := newControllableBackend(t, "second")
+	third := newControllableBackend(t, "third")
+	defer first.Close()
+	defer second.Close()
+	defer third.Close()
+
+	pool := newLeastConnsPool(t, first.Target(), second.Target(), third.Target())
+	for target, active := range map[string]int64{first.Target(): 4, second.Target(): 1, third.Target(): 3} {
+		backend, ok := pool.registry.Get(target)
+		if !ok {
+			t.Fatalf("backend %s missing from registry", target)
+		}
+		backend.activeConns.Store(active)
+	}
+	if got := pool.Next().URL.String(); got != second.Target() {
+		t.Fatalf("Next selected %s; want least-busy backend %s", got, second.Target())
+	}
+}
+
+func TestLeastConnsTieBreakRotates(t *testing.T) {
+	backends := []*controllableBackend{
+		newControllableBackend(t, "one"),
+		newControllableBackend(t, "two"),
+		newControllableBackend(t, "three"),
+	}
+	for _, backend := range backends {
+		defer backend.Close()
+	}
+	pool := newLeastConnsPool(t, backends[0].Target(), backends[1].Target(), backends[2].Target())
+	counts := make(map[string]int)
+	for range 12 {
+		counts[pool.Next().URL.String()]++
+	}
+	for _, backend := range backends {
+		if counts[backend.Target()] != 4 {
+			t.Fatalf("backend %s selected %d times; want each tied backend to rotate", backend.Target(), counts[backend.Target()])
+		}
+	}
+}
+
+func TestLeastConnsSkipsDeadAndQuarantinedBackends(t *testing.T) {
+	dead := newControllableBackend(t, "dead")
+	quarantined := newControllableBackend(t, "quarantined")
+	healthy := newControllableBackend(t, "healthy")
+	defer dead.Close()
+	defer quarantined.Close()
+	defer healthy.Close()
+
+	pool := newLeastConnsPool(t, dead.Target(), quarantined.Target(), healthy.Target())
+	if err := pool.registry.SetAlive(dead.Target(), false); err != nil {
+		t.Fatalf("SetAlive dead backend: %v", err)
+	}
+	quarantinedBackend, ok := pool.registry.Get(quarantined.Target())
+	if !ok {
+		t.Fatal("quarantined backend missing from registry")
+	}
+	quarantinedBackend.mu.Lock()
+	quarantinedBackend.alive = false
+	quarantinedBackend.quarantined = true
+	quarantinedBackend.mu.Unlock()
+	if got := pool.Next().URL.String(); got != healthy.Target() {
+		t.Fatalf("Next selected %s; want only selectable backend %s", got, healthy.Target())
+	}
+}
+
+func TestLeastConnsRoutesAroundBusyBackend(t *testing.T) {
+	slow := newBlockingTestBackend(t, "slow")
+	var quickHits atomic.Int32
+	quick := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		quickHits.Add(1)
+		_, _ = fmt.Fprint(w, "quick")
+	}))
+	t.Cleanup(quick.Close)
+	pool := newLeastConnsPool(t, slow.server.URL, quick.URL)
+	handler := pool.Handler()
+	slowResult := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/slow", nil))
+		slowResult <- recorder.Code
+	}()
+	waitForSignal(t, slow.arrived, "slow backend request")
+
+	slowBackend, _ := pool.registry.Get(slow.server.URL)
+	if got := slowBackend.activeConns.Load(); got != 1 {
+		t.Fatalf("slow backend active connections = %d while held; want 1", got)
+	}
+	for range 6 {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+		if recorder.Code != http.StatusOK || strings.TrimSpace(recorder.Body.String()) != "quick" {
+			t.Fatalf("request while slow backend was busy returned %d %q; want quick backend", recorder.Code, recorder.Body.String())
+		}
+	}
+	if got := quickHits.Load(); got != 6 {
+		t.Fatalf("quick backend handled %d requests while slow backend was held; want 6", got)
+	}
+
+	slow.Release()
+	if code := waitForResult(t, slowResult, "slow backend response", 5*time.Second); code != http.StatusOK {
+		t.Fatalf("slow request returned %d; want 200", code)
+	}
+	quickBackend, _ := pool.registry.Get(quick.URL)
+	if slowBackend.activeConns.Load() != 0 || quickBackend.activeConns.Load() != 0 {
+		t.Fatalf("active connections after completion: slow=%d quick=%d; want both zero", slowBackend.activeConns.Load(), quickBackend.activeConns.Load())
+	}
+
+	seen := make(map[string]bool)
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+		seen[strings.TrimSpace(recorder.Body.String())] = true
+	}
+	if !seen["slow"] || !seen["quick"] {
+		t.Fatalf("after the slow request finished, tied traffic reached %v; want both backends", seen)
+	}
+}
+
+func TestLeastConnsReservationsReleaseOnFailureAndCancellation(t *testing.T) {
+	refused := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	refusedURL := refused.URL
+	refused.Close()
+	failurePool := newLeastConnsPool(t, refusedURL)
+	failureResponse := doRequest(t, failurePool)
+	failureStatus := failurePool.registry.List()[0]
+	if failureResponse.Code != http.StatusBadGateway || failureStatus.TotalRequests != 1 || failureStatus.TotalFailures != 1 || failureStatus.ActiveConns != 0 {
+		t.Fatalf("failed request status=%d counters=%#v; want 502, one request/failure, and no active reservation", failureResponse.Code, failureStatus)
+	}
+
+	blocked := newBlockingTestBackend(t, "done")
+	cancelPool := newLeastConnsPool(t, blocked.server.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		request := httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil).WithContext(ctx)
+		cancelPool.Handler().ServeHTTP(httptest.NewRecorder(), request)
+		close(done)
+	}()
+	waitForSignal(t, blocked.arrived, "cancellable backend request")
+	backend, _ := cancelPool.registry.Get(blocked.server.URL)
+	if got := backend.activeConns.Load(); got != 1 {
+		t.Fatalf("active connections before cancellation = %d; want exactly one reservation", got)
+	}
+	cancel()
+	waitForSignal(t, done, "cancelled request completion")
+	if got := backend.activeConns.Load(); got != 0 {
+		t.Fatalf("active connections after cancellation = %d; want zero", got)
+	}
+}
+
+func TestLeastConnsConcurrentRequestsSpreadAcrossBackends(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+	arrivals := make(chan struct{}, 100)
+	var hits [3]atomic.Int32
+	servers := make([]*httptest.Server, 3)
+	targets := make([]string, 3)
+	for index := range servers {
+		index := index
+		servers[index] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits[index].Add(1)
+			arrivals <- struct{}{}
+			<-release
+			_, _ = fmt.Fprint(w, "ok")
+		}))
+		targets[index] = servers[index].URL
+		t.Cleanup(servers[index].Close)
+	}
+	pool := newLeastConnsPool(t, targets...)
+	handler := pool.Handler()
+	var requests sync.WaitGroup
+	responses := make(chan int, 100)
+	for range 100 {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+			responses <- recorder.Code
+		}()
+	}
+	arrivalCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for range 100 {
+		select {
+		case <-arrivals:
+		case <-arrivalCtx.Done():
+			t.Fatalf("only %d requests reached backends: %v", 100-len(arrivals), arrivalCtx.Err())
+		}
+	}
+	maximum := int32(0)
+	for index := range hits {
+		count := hits[index].Load()
+		if count == 0 {
+			t.Fatalf("backend %d received no concurrent requests", index+1)
+		}
+		if count > maximum {
+			maximum = count
+		}
+	}
+	if maximum > 60 {
+		t.Fatalf("least-connections spread was too uneven: backend request counts %d, %d, %d", hits[0].Load(), hits[1].Load(), hits[2].Load())
+	}
+	releaseAll()
+	requests.Wait()
+	close(responses)
+	for code := range responses {
+		if code != http.StatusOK {
+			t.Fatalf("concurrent request status = %d; want 200", code)
+		}
+	}
+}
+
+func TestLeastConnsRegistryRaceDuringTraffic(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	arrived := make(chan struct{}, 100)
+	var hits atomic.Int32
+	servers := make([]*httptest.Server, 3)
+	targets := make([]string, 3)
+	for index := range servers {
+		servers[index] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			arrived <- struct{}{}
+			<-release
+			_, _ = fmt.Fprint(w, "ok")
+		}))
+		targets[index] = servers[index].URL
+		t.Cleanup(servers[index].Close)
+	}
+	t.Cleanup(releaseAll)
+	pool := newLeastConnsPool(t, targets...)
+	handler := pool.Handler()
+	var requests sync.WaitGroup
+	statuses := make(chan int, 100)
+	for range 100 {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://balancer.test/", nil))
+			statuses <- recorder.Code
+		}()
+	}
+	select {
+	case <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no request reached a backend")
+	}
+
+	mutationServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "mutation")
+	}))
+	t.Cleanup(mutationServer.Close)
+	for iteration := range 20 {
+		if err := pool.registry.SetAlive(targets[1], iteration%2 == 0); err != nil {
+			t.Fatalf("SetAlive backend 2: %v", err)
+		}
+		if err := pool.registry.SetAlive(targets[2], iteration%2 != 0); err != nil {
+			t.Fatalf("SetAlive backend 3: %v", err)
+		}
+		if _, err := pool.registry.Add(mutationServer.URL); err != nil {
+			t.Fatalf("Add mutation backend: %v", err)
+		}
+		_ = pool.registry.List()
+		if err := pool.registry.Remove(mutationServer.URL); err != nil {
+			t.Fatalf("Remove mutation backend: %v", err)
+		}
+	}
+	releaseAll()
+	requests.Wait()
+	close(statuses)
+	for status := range statuses {
+		if status != http.StatusOK && status != http.StatusBadGateway && status != http.StatusServiceUnavailable {
+			t.Fatalf("request status = %d; want only 200, 502, or 503", status)
+		}
+	}
+	if hits.Load() == 0 {
+		t.Fatal("no traffic reached a backend")
 	}
 }
 

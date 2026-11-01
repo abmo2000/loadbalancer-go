@@ -25,6 +25,7 @@ var defaultBackends = []string{
 type Config struct {
 	ListenAddr           string
 	Backends             []string
+	Strategy             string
 	BackendHealth        map[string]BackendHealth
 	HealthInterval       time.Duration
 	HealthTimeout        time.Duration
@@ -57,6 +58,7 @@ func DefaultConfig() Config {
 	return Config{
 		ListenAddr:           ":8080",
 		Backends:             append([]string(nil), defaultBackends...),
+		Strategy:             "round_robin",
 		BackendHealth:        make(map[string]BackendHealth),
 		HealthInterval:       5 * time.Second,
 		HealthTimeout:        2 * time.Second,
@@ -122,6 +124,9 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 
 	if v, ok := lookupEnvValue(getenv, "LB_LISTEN_ADDR"); ok {
 		cfg.ListenAddr = v
+	}
+	if v, ok := lookupEnvValue(getenv, "LB_STRATEGY"); ok {
+		cfg.Strategy = v
 	}
 	backendsValue := strings.Join(cfg.Backends, ",")
 	if v, ok := lookupEnvValue(getenv, "LB_BACKENDS"); ok {
@@ -207,6 +212,7 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	fs.SetOutput(&flagOutput)
 	listenAddr := cfg.ListenAddr
 	fs.StringVar(&listenAddr, "listen", cfg.ListenAddr, "listen address")
+	fs.StringVar(&cfg.Strategy, "strategy", cfg.Strategy, "load-balancing strategy: round_robin or least_conns")
 	fs.StringVar(&backendsValue, "backends", backendsValue, "comma-separated backend URLs")
 	fs.DurationVar(&cfg.HealthInterval, "health-interval", cfg.HealthInterval, "health check interval")
 	fs.DurationVar(&cfg.HealthTimeout, "health-timeout", cfg.HealthTimeout, "health check HTTP client timeout")
@@ -242,6 +248,7 @@ func LoadConfig(getenv func(string) string, args []string) (Config, error) {
 	}
 
 	cfg.ListenAddr = listenAddr
+	cfg.Strategy = strings.ToLower(strings.TrimSpace(cfg.Strategy))
 	var backendParseProblems []error
 	cfg.Backends, cfg.BackendHealth, backendParseProblems = parseBackendSpecs(backendsValue)
 	parseProblems = append(parseProblems, backendParseProblems...)
@@ -317,6 +324,11 @@ const maxConfigDuration = 24 * time.Hour
 
 func (c *Config) Validate() error {
 	var problems []error
+	switch strings.ToLower(strings.TrimSpace(c.Strategy)) {
+	case "round_robin", "least_conns":
+	default:
+		problems = append(problems, fmt.Errorf("LB_STRATEGY: %q must be one of round_robin, least_conns", c.Strategy))
+	}
 
 	if len(c.Backends) == 0 {
 		problems = append(problems, fmt.Errorf("LB_BACKENDS: %q must contain at least one http(s) backend URL", strings.Join(c.Backends, ",")))
@@ -635,9 +647,10 @@ func (c Config) String() string {
 		backends = append(backends, entry)
 	}
 	return fmt.Sprintf(
-		"listen=%s backends=%v healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s flapWindow=%s flapMaxTransitions=%d quarantineBase=%s quarantineMax=%s quarantineResetAfter=%s maxQuarantinePercent=%d dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
+		"listen=%s backends=%v strategy=%s healthInterval=%s healthTimeout=%s healthFailThreshold=%d healthRiseThreshold=%d healthPath=%s flapWindow=%s flapMaxTransitions=%d quarantineBase=%s quarantineMax=%s quarantineResetAfter=%s maxQuarantinePercent=%d dialTimeout=%s responseTimeout=%s readHeaderTimeout=%s readTimeout=%s writeTimeout=%s idleTimeout=%s shutdownTimeout=%s",
 		c.ListenAddr,
 		backends,
+		c.Strategy,
 		c.HealthInterval,
 		c.HealthTimeout,
 		c.FailThreshold,

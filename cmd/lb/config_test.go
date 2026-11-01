@@ -137,6 +137,41 @@ func TestLoadConfig_FlagsOverrideEnv(t *testing.T) {
 	}
 }
 
+func TestStrategyConfig(t *testing.T) {
+	cfg, err := LoadConfig(envLookup(nil), nil)
+	if err != nil {
+		t.Fatalf("LoadConfig default returned error: %v", err)
+	}
+	if cfg.Strategy != "round_robin" {
+		t.Fatalf("default strategy = %q; want round_robin", cfg.Strategy)
+	}
+
+	cfg, err = LoadConfig(envLookup(map[string]string{"LB_STRATEGY": "LEAST_CONNS"}), nil)
+	if err != nil || cfg.Strategy != "least_conns" {
+		t.Fatalf("env strategy = %q, error = %v; want least_conns", cfg.Strategy, err)
+	}
+
+	cfg, err = LoadConfig(envLookup(map[string]string{"LB_STRATEGY": "least_conns"}), []string{"-strategy", "ROUND_ROBIN"})
+	if err != nil || cfg.Strategy != "round_robin" {
+		t.Fatalf("flag strategy = %q, error = %v; want round_robin", cfg.Strategy, err)
+	}
+	if !strings.Contains(cfg.String(), "strategy=round_robin") {
+		t.Fatalf("effective config %q does not report strategy", cfg.String())
+	}
+
+	invalid, err := LoadConfig(envLookup(map[string]string{"LB_STRATEGY": "fastest"}), nil)
+	if err != nil {
+		t.Fatalf("LoadConfig returned parse error for invalid strategy: %v", err)
+	}
+	assertConfigError(t, invalid.Validate(), "LB_STRATEGY", "fastest", "round_robin", "least_conns")
+
+	aggregated, parseErr := LoadConfig(envLookup(map[string]string{
+		"LB_STRATEGY":         "fastest",
+		"LB_RESPONSE_TIMEOUT": "later",
+	}), nil)
+	assertConfigError(t, errors.Join(parseErr, aggregated.Validate()), "LB_STRATEGY", "fastest", "LB_RESPONSE_TIMEOUT", "later")
+}
+
 func TestLoadConfig_CheckOnly(t *testing.T) {
 	cfg, err := LoadConfig(envLookup(map[string]string{"LB_CHECK_ONLY": "true"}), nil)
 	if err != nil {

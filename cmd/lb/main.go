@@ -320,12 +320,78 @@ func (b *Backend) status() BackendStatus {
 
 type Pool struct {
 	registry       *Registry
-	counter        uint64
+	counter        atomic.Uint64
+	strategyCount  atomic.Uint64
+	strategy       Strategy
 	healthInterval time.Duration
 	healthTimeout  time.Duration
 	failThreshold  int
 	riseThreshold  int
 	healthPath     string
+}
+
+type Strategy interface {
+	Pick(candidates []*Backend, snapshot []*Backend, reserve bool) (*Backend, bool)
+}
+
+type roundRobinStrategy struct {
+	counter *atomic.Uint64
+}
+
+func (strategy *roundRobinStrategy) Pick(candidates, snapshot []*Backend, _ bool) (*Backend, bool) {
+	if len(candidates) == 0 || len(snapshot) == 0 {
+		return nil, false
+	}
+	start := strategy.counter.Add(1)
+	n := uint64(len(snapshot))
+	for offset := uint64(0); offset < n; offset++ {
+		backend := snapshot[(start+offset)%n]
+		if backend.IsAlive() {
+			return backend, false
+		}
+	}
+	return nil, false
+}
+
+type leastConnsStrategy struct {
+	counter *atomic.Uint64
+}
+
+func (strategy *leastConnsStrategy) Pick(candidates, _ []*Backend, reserve bool) (*Backend, bool) {
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	for {
+		start := (strategy.counter.Add(1) - 1) % uint64(len(candidates))
+		var selected *Backend
+		var lowest int64
+		for offset := uint64(0); offset < uint64(len(candidates)); offset++ {
+			candidate := candidates[(start+offset)%uint64(len(candidates))]
+			active := candidate.activeConns.Load()
+			if selected == nil || active < lowest {
+				selected = candidate
+				lowest = active
+			}
+		}
+		if !reserve {
+			return selected, false
+		}
+		if selected.activeConns.CompareAndSwap(lowest, lowest+1) {
+			return selected, true
+		}
+	}
+}
+
+func (p *Pool) SetStrategy(name string) error {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "round_robin":
+		p.strategy = &roundRobinStrategy{counter: &p.counter}
+	case "least_conns":
+		p.strategy = &leastConnsStrategy{counter: &p.strategyCount}
+	default:
+		return fmt.Errorf("unknown strategy %q; allowed values are round_robin, least_conns", name)
+	}
+	return nil
 }
 
 func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
@@ -344,23 +410,31 @@ func NewPool(targets []string, args ...time.Duration) (*Pool, error) {
 			return nil, err
 		}
 	}
-	return &Pool{registry: registry, healthInterval: 5 * time.Second, healthTimeout: 2 * time.Second, failThreshold: 3, riseThreshold: 2, healthPath: "/"}, nil
+	pool := &Pool{registry: registry, healthInterval: 5 * time.Second, healthTimeout: 2 * time.Second, failThreshold: 3, riseThreshold: 2, healthPath: "/"}
+	if err := pool.SetStrategy("round_robin"); err != nil {
+		return nil, err
+	}
+	return pool, nil
 }
 
 func (p *Pool) Next() *Backend {
+	backend, _ := p.next(false)
+	return backend
+}
+
+func (p *Pool) next(reserve bool) (*Backend, bool) {
 	backends := p.registry.snapshot()
-	n := uint64(len(backends))
-	if n == 0 {
-		return nil
-	}
-	start := atomic.AddUint64(&p.counter, 1)
-	for i := uint64(0); i < n; i++ {
-		b := backends[(start+i)%n]
-		if b.IsAlive() {
-			return b
+	candidates := make([]*Backend, 0, len(backends))
+	for _, backend := range backends {
+		if backend.IsAlive() {
+			candidates = append(candidates, backend)
 		}
 	}
-	return nil
+	strategy := p.strategy
+	if strategy == nil {
+		strategy = &roundRobinStrategy{counter: &p.counter}
+	}
+	return strategy.Pick(candidates, backends, reserve)
 }
 
 func (p *Pool) CheckOnce() {
@@ -516,14 +590,16 @@ func (p *Pool) HealthCheck(interval time.Duration) {
 
 func (p *Pool) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b := p.Next()
+		b, reserved := p.next(true)
 		if b == nil {
 			http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 			return
 		}
-		b.totalRequests.Add(1)
-		b.activeConns.Add(1)
+		if !reserved {
+			b.activeConns.Add(1)
+		}
 		defer b.activeConns.Add(-1)
+		b.totalRequests.Add(1)
 		b.Proxy.ServeHTTP(w, r)
 	})
 }
@@ -631,6 +707,9 @@ func main() {
 
 	pool, err := NewPool(cfg.Backends, cfg.DialTimeout, cfg.ResponseTimeout)
 	if err != nil {
+		log.Fatal(err)
+	}
+	if err := pool.SetStrategy(cfg.Strategy); err != nil {
 		log.Fatal(err)
 	}
 	pool.ConfigureHealthChecks(cfg.HealthTimeout, cfg.FailThreshold, cfg.RiseThreshold, cfg.HealthPath)
