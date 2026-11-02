@@ -68,6 +68,18 @@ With the default `LB_RESPONSE_TIMEOUT` of `10s` this returns `502`; raise the ti
 - **Registry** owns every backend and its state (alive, dead or quarantined, counters, last check).
 - **Health scheduler** probes backends and updates their state in the registry.
 
+## Proxy behavior
+
+The balancer uses Go's `httputil.NewSingleHostReverseProxy`. The default Director sets the upstream URL but leaves the incoming `Host` value unchanged.
+
+| Aspect | Behavior |
+| --- | --- |
+| Forwarded unchanged | Request method, path, query, ordinary headers and body; response status and ordinary headers |
+| Added | `X-Forwarded-For` includes the client IP |
+| Removed | Hop-by-hop headers, including headers nominated by `Connection` |
+| Not touched | Backend status codes and redirects are not interpreted or followed by the proxy; response bodies are copied, subject to the gzip transport behavior in Known gaps |
+| Host | The backend sees the original client-facing `Host`, not the backend URL's authority |
+
 ## Load-balancing strategies
 
 `round_robin` is the default and preserves the existing rotating order. Select `least_conns` to prefer the selectable backend with the fewest active requests. Use either the `LB_STRATEGY` environment variable or the `-strategy` flag; flag values override environment values. Values are case-insensitive.
@@ -305,6 +317,7 @@ Test design notes: readiness checks use a TCP dial because an HTTP probe would p
 | Per-backend health | `TestBackendHealthSpecParsing`, `TestBackendHealthSpecErrors`, `TestBackendHealthEffectiveValuesAndNormalizedDuplicates`, `TestBackendHealthEffectiveValidationAndLargestFlapInterval`, `TestBackendHealthWarningsArePerBackend`, `TestPerBackendHealthPaths`, `TestPerBackendHealthTimeouts`, `TestCheckDueUsesPerBackendIntervals`, `TestCheckDueDynamicAddRemoveAndCheckOnceAll`, `TestCheckDueNonOverlapAcrossIntervals`, `TestPerBackendStatusShowsEffectiveSchedule`, `TestPerBackendSchedulerCancellation`, `TestPerBackendSchedulerRegistryRace` |
 | Flap protection | `TestFlapProtectionDisabledKeepsThresholdBehavior`, `TestFourTransitionsQuarantineAndHoldDown`, `TestExpiredQuarantineStillRequiresRiseThreshold`, `TestQuarantineExponentialGrowthAndCap`, `TestQuarantineLevelResetsAfterStableAlivePeriod`, `TestTransitionsOutsideWindowDoNotQuarantine`, `TestQuarantineCapacitySafety`, `TestCapacityLimitDoesNotBlockRealFailureEjection`, `TestQuarantineTransitionLogsOnlyOnce`, `TestFlapRegistryRace` |
 | Configuration | `TestLoadConfig_Defaults`, `TestLoadConfig_EnvOverridesDefaults`, `TestLoadConfig_FlagsOverrideEnv`, `TestLoadConfig_CheckOnly`, `TestLoadConfig_BackendsParsing`, `TestLoadConfig_InvalidDuration`, `TestLoadConfig_InvalidDurationNamesValue`, `TestLoadConfig_AggregatesInvalidDurations`, `TestLoadConfig_HelpFlag`, `TestValidate_*`, `TestHealthCheckConfigValidation`, `TestFlapConfigValidation`, `TestWarnings_*`, `TestPreflight` |
+| Proxy behavior | `proxy_test.go` covers gzip transport behavior, methods, query/path preservation, request/response headers, request bodies and streaming, status passthrough, health-probe separation, unavailable backends, and concurrent request isolation under both strategies. |
 
 `TestStrategyConfig` verifies the default, env/flag precedence, case-insensitive values, invalid-value diagnostics, and aggregation with another config error.
 
@@ -334,6 +347,22 @@ These flags exist for demos and tests only and default to off:
 
 - `cmd/backend -flaky-period 4s`: alternates healthy and `503` responses on `/` in periods measured from process start. `/slow` is unchanged.
 - `cmd/backend -log-requests`: logs each request as a timestamp, method and path, which shows probe paths and schedules.
+
+## Known gaps
+
+- The proxy's upstream `http.Transport` does not set `DisableCompression`. When the incoming request has no `Accept-Encoding`, the transport adds `Accept-Encoding: gzip` and transparently decompresses a gzip response, removing `Content-Encoding` before it reaches the client. `TestProxyGzipWhenClientSendsNoAcceptEncoding` documents this behavior for both selection strategies. A transparent proxy would set `DisableCompression: true`; that is a Phase 2 design decision and is not changed here. When a client explicitly sends `Accept-Encoding: gzip`, `TestProxyGzipResponsePreserved` verifies the compressed bytes and `Content-Encoding` pass through unchanged.
+
+## Deferred tests (before publishing)
+
+- Very large bodies (100 MB+) and memory behavior.
+- Many concurrent uploads and downloads.
+- Slow clients (slowloris) and slow request bodies.
+- Long-lived streaming.
+- Upgrade and WebSocket passthrough.
+- Huge or many headers.
+- Keep-alive and file descriptors under load.
+- Fuzz tests.
+- HTTP/2 and TLS.
 
 ## Design decisions and known limits
 

@@ -17,6 +17,7 @@ HTTP reverse proxy/load balancer using only the Go standard library. Phase 0 is 
 - `cmd/lb/config_test.go`: config parsing, precedence, validation, warnings, and preflight tests.
 - `cmd/lb/main.go`: backend/proxy state, pool selection, health checks, request handler, server lifecycle, and process entry point.
 - `cmd/lb/main_test.go`: round-robin, least-connections, safe retries, failover, requests, shutdown, concurrency, and pool-selection tests.
+- `cmd/lb/proxy_test.go`: `recordedProxyRequest`, `recordingBackend`, `newRecordingBackend`, `newRecordingBackendWithHandler`, `newProxyTestClient`, `newProxyTestServer`, `doProxyRequest`, `readProxyResponse`, `receiveProxyRequest`, `gzipProxyBody`, `assertProxyBody`, and `equalStrings` support reverse-proxy behavior tests under both selection strategies.
 - `cmd/lb/registry.go`: backend registry, immutable snapshots, status, health-state transitions, failure policy, and quarantine.
 - `cmd/lb/registry_test.go`: registry, health-check, passive failure, scheduling, race, and quarantine tests.
 - `cmd/backend/main.go`: small demo backend with `/slow` and optional flaky/request logging modes.
@@ -69,7 +70,7 @@ Validation is in `Config.Validate` (`cmd/lb/config.go`); parse-time errors aggre
 | Check-only | `LB_CHECK_ONLY` | `-check` | `false` |
 
 ## Test conventions
-Tests use the standard library, `httptest` servers, injected clocks, and free listener ports; avoid fixed ports and `time.Sleep` for synchronization. Never weaken existing assertions. `config_test.go` covers config; `main_test.go` covers pool/request/failover/shutdown; `registry_test.go` covers registry/health/quarantine/concurrency. `go test -race` requires `gcc`.
+Tests use the standard library, `httptest` servers, injected clocks, and free listener ports; avoid fixed ports and `time.Sleep` for synchronization. Never weaken existing assertions. `config_test.go` covers config; `main_test.go` covers pool/request/failover/shutdown; `proxy_test.go` covers gzip behavior, methods, paths/queries, headers, bodies/streaming, status passthrough, health-probe separation, failed backends, and concurrent isolation using `recordedProxyRequest`, `recordingBackend`, `newRecordingBackend`, `newRecordingBackendWithHandler`, `newProxyTestClient`, `newProxyTestServer`, `doProxyRequest`, `readProxyResponse`, `receiveProxyRequest`, `gzipProxyBody`, `assertProxyBody`, and `equalStrings`; `registry_test.go` covers registry/health/quarantine/concurrency. `go test -race` requires `gcc`.
 
 ## Known limits and roadmap
 Registry state and counters are in memory and reset on restart. No retry budget yet. No admin API; Phase 2. WebSocket hijacked connections are not drained by `http.Server.Shutdown`. Update this map at the end of future tasks if repository structure changes.
